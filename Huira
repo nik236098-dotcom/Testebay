@@ -1,0 +1,50 @@
+
+server {
+    listen 80;
+    server_name pokergena.duckdns.org;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name pokergena.duckdns.org;
+
+    ssl_certificate /etc/letsencrypt/live/pokergena.duckdns.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pokergena.duckdns.org/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+EOF
+
+
+
+
+server {
+    listen 80;
+    server_name pokergena.duckdns.org;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name pokergena.duckdns.org;
+
+    ssl_certificate /etc/letsencrypt/live/pokergena.duckdns.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pokergena.duckdns.org/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}

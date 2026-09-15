@@ -59,6 +59,34 @@ DEFAULT_QUERY = "country[]=UZ&min_contacts=100&spam=no"
 MAX_SEEN_IDS = 5000
 TELEGRAM_MESSAGE_LIMIT = 4096
 
+# Диагностика последней проверки, показывается в /status
+STATS: dict = {
+    "started_at": time.time(),
+    "checks": 0,
+    "last_check_at": None,
+    "last_items": None,
+    "last_new": 0,
+    "last_error": None,
+    "last_error_at": None,
+    "last_meta": {},
+}
+
+
+def _record_error(message: str) -> None:
+    STATS["last_error"] = message[:300]
+    STATS["last_error_at"] = time.time()
+
+
+def _ago(ts) -> str:
+    if not ts:
+        return "ещё не было"
+    delta = int(time.time() - ts)
+    if delta < 60:
+        return f"{delta} с назад"
+    if delta < 3600:
+        return f"{delta // 60} мин назад"
+    return f"{delta // 3600} ч {delta % 3600 // 60} мин назад"
+
 
 class Config:
     def __init__(self) -> None:
@@ -228,6 +256,7 @@ class LztClient:
                 resp = self.session.get(url, params=params, timeout=30)
             except requests.RequestException as exc:
                 log.warning("Ошибка сети (попытка %d): %s", attempt, exc)
+                _record_error(f"сеть: {exc}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
@@ -235,25 +264,43 @@ class LztClient:
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", backoff))
                 log.warning("Лимит запросов API, жду %d с", retry_after)
+                _record_error("API: превышен лимит запросов (429)")
                 time.sleep(retry_after)
                 backoff = min(backoff * 2, 60)
                 continue
             if resp.status_code in (401, 403):
-                raise SystemExit(
-                    f"API вернул {resp.status_code}: проверьте LZT_TOKEN. Ответ: {resp.text[:300]}"
-                )
+                _record_error(f"API {resp.status_code}: проверьте LZT_TOKEN. {resp.text[:200]}")
+                log.error("API вернул %d: проверьте LZT_TOKEN. Ответ: %s", resp.status_code, resp.text[:300])
+                return []
             if resp.status_code >= 500:
                 log.warning("API вернул %d, повтор через %d с", resp.status_code, backoff)
+                _record_error(f"API вернул {resp.status_code}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
 
-            resp.raise_for_status()
-            data = resp.json()
+            if resp.status_code >= 400:
+                _record_error(f"API {resp.status_code}: {resp.text[:200]}")
+                log.error("API вернул %d: %s", resp.status_code, resp.text[:300])
+                return []
+            try:
+                data = resp.json()
+            except ValueError:
+                _record_error(f"API вернул не JSON: {resp.text[:200]}")
+                log.error("API вернул не JSON: %s", resp.text[:300])
+                return []
             if isinstance(data, dict) and data.get("errors"):
-                raise RuntimeError(f"API вернул ошибку: {data['errors']}")
-            # Ответ: {"items": [...], "totalItems": N, "perPage": N, "hasNextPage": bool, ...}
+                _record_error(f"API: {data['errors']}")
+                log.error("API вернул ошибку: %s", data["errors"])
+                return []
+            # Ответ: {"items": [...], "totalItems": N, "perPage": N, "hasNextPage": bool,
+            #         "cacheTTL": N, "wasCached": bool, ...}
             items = data.get("items", []) if isinstance(data, dict) else []
+            if isinstance(data, dict):
+                STATS["last_meta"] = {
+                    k: data.get(k) for k in ("totalItems", "perPage", "wasCached", "cacheTTL", "hasNextPage")
+                    if k in data
+                }
             return [i for i in items if isinstance(i, dict) and "item_id" in i]
 
         log.error("Не удалось получить список лотов после нескольких попыток")
@@ -275,6 +322,7 @@ class WebClient:
             )
         except (WebSourceError, requests.RequestException) as exc:
             log.error("Не удалось загрузить страницу: %s", exc)
+            _record_error(f"страница: {exc}")
             return []
 
 
@@ -433,13 +481,27 @@ class Bot:
                 subs = len(self.state.subscribers)
                 seen = len(self.state.seen_ids)
                 subscribed = chat_id in self.state.subscribers
-            self.tg.send(
-                chat_id,
-                f"Фильтр: {html.escape(self.cfg.site_url())}\n"
-                f"Источник: {self.cfg.source}, интервал: {self.cfg.poll_interval} с\n"
-                f"Подписчиков: {subs}, запомнено лотов: {seen}\n"
+            last_items = STATS["last_items"]
+            meta = STATS["last_meta"]
+            lines = [
+                f"Фильтр: {html.escape(self.cfg.site_url())}",
+                f"Источник: {self.cfg.source}, интервал: {self.cfg.poll_interval} с",
+                f"Подписчиков: {subs}, запомнено лотов: {seen}",
                 f"Этот чат {'подписан ✅' if subscribed else 'не подписан'}",
-            )
+                "",
+                f"Работает: {_ago(STATS['started_at']).replace(' назад', '')}, проверок: {STATS['checks']}",
+                f"Последняя проверка: {_ago(STATS['last_check_at'])}",
+            ]
+            if last_items is not None:
+                lines.append(f"Лотов по фильтру: {last_items}, новых в последней проверке: {STATS['last_new']}")
+            if meta:
+                lines.append("Ответ API: " + html.escape(", ".join(f"{k}={v}" for k, v in meta.items())))
+            if STATS["last_error"]:
+                lines.append(
+                    f"⚠️ Последняя ошибка ({_ago(STATS['last_error_at'])}): "
+                    + html.escape(str(STATS["last_error"]))
+                )
+            self.tg.send(chat_id, "\n".join(lines))
         else:
             self.tg.send(chat_id, self.HELP)
 
@@ -557,10 +619,20 @@ def format_item(item: dict) -> str:
 
 def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Telegram) -> int:
     items = lzt.fetch_items(cfg.category, cfg.api_params())
+    STATS["checks"] += 1
+    STATS["last_check_at"] = time.time()
+    STATS["last_items"] = len(items)
+    STATS["last_new"] = 0
     if not items:
+        log.warning("Проверка #%d: лотов нет (ошибка или пустой фильтр)", STATS["checks"])
         return 0
 
     new_items = [i for i in items if not state.is_seen(int(i["item_id"]))]
+    STATS["last_new"] = len(new_items)
+    log.info(
+        "Проверка #%d: лотов %d, новых %d, ответ %s",
+        STATS["checks"], len(items), len(new_items), STATS["last_meta"] or "-",
+    )
 
     if not state.initialized:
         state.initialized = True
@@ -657,8 +729,9 @@ def main(argv: list[str]) -> int:
             check_once(cfg, state, lzt, tg)
         except SystemExit:
             raise
-        except Exception:  # noqa: BLE001 - монитор не должен падать из-за одной ошибки
+        except Exception as exc:  # noqa: BLE001 - монитор не должен падать из-за одной ошибки
             log.exception("Ошибка при проверке")
+            _record_error(f"{type(exc).__name__}: {exc}")
         if once:
             return 0
         time.sleep(cfg.poll_interval)

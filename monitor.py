@@ -100,6 +100,7 @@ class Config:
         self.notify_on_startup = os.getenv("NOTIFY_ON_STARTUP", "1") == "1"
         self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"
         self.send_session_files = os.getenv("SEND_SESSION_FILES", "1") == "1"
+        self.session_only = os.getenv("SESSION_ONLY", "1") == "1"  # присылать только .session, без JSON и сводки
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -652,26 +653,64 @@ def _maybe_binary(value: str) -> bytes | None:
     return None
 
 
-def stringsession_to_session(session_str: str) -> bytes | None:
-    """Строковую сессию Telethon -> настоящий .session (SQLite). Нужен пакет telethon."""
-    try:
-        import tempfile
-        from telethon.sessions import StringSession, SQLiteSession
-    except Exception:  # noqa: BLE001 - telethon не установлен
+def _parse_telethon_string(session_str: str):
+    """Строковая сессия Telethon -> (dc_id, ip, port, auth_key). Без зависимостей."""
+    import socket
+    import struct
+    s = session_str.strip()
+    if not s or s[0] != "1":
         return None
+    s = s[1:]
     try:
-        ss = StringSession(session_str)
+        raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    except Exception:  # noqa: BLE001
+        return None
+    ip_len = 4 if len(raw) == 4 + 1 + 2 + 256 else 16
+    try:
+        dc_id, ip, port, auth_key = struct.unpack(f">B{ip_len}sH256s", raw)
+    except struct.error:
+        return None
+    family = socket.AF_INET if ip_len == 4 else socket.AF_INET6
+    try:
+        addr = socket.inet_ntop(family, ip)
+    except OSError:
+        addr = ""
+    return dc_id, addr, port, auth_key
+
+
+def _make_telethon_session(dc_id: int, ip: str, port: int, auth_key: bytes) -> bytes | None:
+    """Собирает файл .session (SQLite в формате Telethon) из данных сессии."""
+    import sqlite3
+    import tempfile
+    try:
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "s")
-            sql = SQLiteSession(path)
-            sql.set_dc(ss.dc_id, ss.server_address, ss.port)
-            sql.auth_key = ss.auth_key
-            sql.save()
-            sql.close()
-            with open(path + ".session", "rb") as f:
+            path = os.path.join(d, "s.session")
+            con = sqlite3.connect(path)
+            cur = con.cursor()
+            cur.execute("CREATE TABLE version (version integer primary key)")
+            cur.execute("CREATE TABLE sessions (dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer)")
+            cur.execute("CREATE TABLE entities (id integer primary key, hash integer not null, username text, phone integer, name text, date integer)")
+            cur.execute("CREATE TABLE sent_files (md5_digest blob, file_size integer, type integer, id integer, hash integer, primary key(md5_digest, file_size, type))")
+            cur.execute("CREATE TABLE update_state (id integer primary key, pts integer, qts integer, date integer, seq integer)")
+            cur.execute("INSERT INTO version VALUES (7)")
+            cur.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (dc_id, ip, port, auth_key, None))
+            con.commit()
+            con.close()
+            with open(path, "rb") as f:
                 return f.read()
     except Exception:  # noqa: BLE001
         return None
+
+
+def stringsession_to_session(session_str: str) -> bytes | None:
+    """Строковую сессию Telethon -> настоящий .session (SQLite), без внешних библиотек."""
+    parsed = _parse_telethon_string(session_str)
+    if not parsed:
+        return None
+    dc_id, ip, port, auth_key = parsed
+    if not auth_key or all(b == 0 for b in auth_key) or not ip:
+        return None
+    return _make_telethon_session(dc_id, ip, port, auth_key)
 
 
 def _flatten(data, prefix: str = "") -> dict[str, object]:
@@ -1273,18 +1312,25 @@ class Bot:
         except Exception:  # noqa: BLE001
             log.exception("Не удалось собрать файлы аккаунта %s", item_id)
             files, summary = [], ""
-        if summary:
+        sessions = [(n, c) for n, c in files if n.endswith(".session")]
+        # Если собрали готовый .session — шлём только его, без JSON и сводки
+        if sessions and self.cfg.session_only:
+            to_send, with_summary = sessions, False
+        else:
+            to_send, with_summary = files, True
+        if with_summary and summary:
             self.tg.send(chat_id, f"🔑 Данные аккаунта {item_id}:\n<pre>{html.escape(summary)}</pre>")
         sent = 0
-        for name, content in files:
+        for name, content in to_send:
             if len(content) > 49 * 1024 * 1024:  # лимит Telegram на документ
                 continue
             if self.tg.send_document(chat_id, name, content, caption=f"{site}: аккаунт {item_id}"):
                 sent += 1
         if sent:
             log.info("%s: выгружено %d файлов аккаунта %d пользователю %s", site, sent, item_id, rt.profile["user_id"])
-        else:
-            self.tg.send(chat_id, "📎 Файлы аккаунта отправить не удалось, данные во вложенном JSON или на странице лота.")
+        elif not sessions:
+            self.tg.send(chat_id, "📎 Готовый .session собрать не удалось. Данные во вложенном JSON или на странице лота. "
+                                  "Если нужен именно .session, пришлите структуру ответа (названия полей).")
 
     # --- регистрация и токены ---
 

@@ -2761,6 +2761,7 @@ class Bot:
             return
         lines = ["🔎 <b>Результат проверки</b>"]
         rows = []
+        to_send: list[dict] = []
         if not rt.lock.acquire(timeout=20):
             lines.append("\nПлановая проверка ещё выполняется. Попробуйте через минуту.")
         else:
@@ -2787,22 +2788,19 @@ class Bot:
                     lines.append(f"Подходящих в полученной выборке: <b>{len(items)}</b>")
                     if not items:
                         lines.append("Ничего не найдено. Проверьте страну, контакты и ограничение цены.")
-                    latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
-                    for item in latest:
-                        title = str(item.get("title") or "Аккаунт №" + str(item["item_id"]))[:80]
-                        lines.append("• " + html.escape(title) + " — " + html.escape(money(item.get("price"), item.get("price_currency") or "RUB")))
-                        # Reuse the existing validated item URL; keep manual results in one message.
-                        for row in self.item_keyboard(rt, item).get("inline_keyboard", []):
-                            for button in row:
-                                if button.get("url"):
-                                    rows.append([{"text": label + " · открыть №" + str(item["item_id"]), "url": button["url"]}])
-                                    break
+                        continue
+                    latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:CHECK_SHOW_ITEMS]
+                    lines.append(f"Последние {len(latest)} — отдельными сообщениями ниже, с кнопкой «Купить».")
+                    to_send.extend(latest)
             finally:
                 rt.lock.release()
         rows.extend(self.menu_keyboard()["inline_keyboard"])
         with self.flow_lock:
             if self.profile(p["user_id"]) is p and self.active_pages.get((p["user_id"], chat_id)) == ("check", message_id):
                 self.show_page(p, chat_id, "\n".join(lines), {"inline_keyboard": rows}, "check", message_id)
+        # Сами лоты — обычными сообщениями в чат, как при плановой проверке: с полным описанием и кнопками
+        for item in to_send:
+            self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
 
     def cmd_lztdump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
         if not rt or rt.lzt is None:
@@ -2965,6 +2963,7 @@ def check_user(bot: Bot, rt: UserRuntime) -> None:
         _check_user(bot, rt)
 
 
+CHECK_SHOW_ITEMS = 3  # сколько последних лотов с каждой площадки присылать по /check
 DOWN_AFTER_FAILS = 2  # столько плановых проверок подряд с ошибкой = сайт «лёг»
 UP_AFTER_OKS = 2      # столько удачных проверок подряд после этого = сайт «встал» (один проскочивший запрос не считаем)
 

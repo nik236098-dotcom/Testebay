@@ -77,6 +77,15 @@ def _ago(ts) -> str:
     return f"{delta // 3600} ч {delta % 3600 // 60} мин назад"
 
 
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
+
+
 def _mask(token: str | None) -> str:
     if not token:
         return "не задан"
@@ -2266,6 +2275,31 @@ def check_user(bot: Bot, rt: UserRuntime) -> None:
         _check_user(bot, rt)
 
 
+DOWN_AFTER_FAILS = 2  # столько плановых проверок подряд с ошибкой = сайт «лёг», шлём уведомление
+
+
+def track_availability(bot: Bot, rt: UserRuntime, name: str, label: str, error: str | None) -> None:
+    """Сайт перестал отвечать -> одно сообщение «не отвечает»; снова ответил -> «снова работает».
+    Одиночный сбой не считаем: ждём DOWN_AFTER_FAILS проверок подряд."""
+    st = rt.stats
+    since_key, fails_key = f"{name}_down_since", f"{name}_fails"
+    if error:
+        st[fails_key] = st.get(fails_key, 0) + 1
+        if st.get(since_key) is None and st[fails_key] >= DOWN_AFTER_FAILS:
+            st[since_key] = time.time()
+            log.warning("%s/%s: сайт не отвечает: %s", rt.profile["user_id"], name, error)
+            bot.tg.send_all(rt.chats, f"⚠️ {label} не отвечает: {html.escape(error)}\n"
+                                      "Продолжаю проверять и напишу, как только заработает.")
+        return
+    st[fails_key] = 0
+    since = st.get(since_key)
+    if since is not None:
+        st[since_key] = None
+        log.info("%s/%s: сайт снова отвечает", rt.profile["user_id"], name)
+        bot.tg.send_all(rt.chats, f"🟢 {label} снова работает, не отвечал {_duration(time.time() - since)}. "
+                                  "Слежу за новыми лотами.")
+
+
 def _check_user(bot: Bot, rt: UserRuntime) -> None:
     p, st = rt.profile, rt.stats
     if rt.lzt is not None:
@@ -2275,6 +2309,7 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         st["last_items"] = len(items)
         st["last_new"] = 0
         rt.record_error(rt.lzt.last_error)
+        track_availability(bot, rt, "lzt", "lzt.market", rt.lzt.last_error)
         rt.lzt.last_error = None
         if items:
             seen = p["seen"]["lzt"]
@@ -2290,6 +2325,7 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         st["tron_items"] = len(items)
         st["tron_new"] = 0
         rt.record_error(rt.tron.last_error)
+        track_availability(bot, rt, "tron", "tronaccs", rt.tron.last_error)
         rt.tron.last_error = None
         if items:
             seen = p["seen"]["tron"]

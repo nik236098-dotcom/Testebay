@@ -34,7 +34,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode
 
@@ -884,7 +884,7 @@ class Bot:
                 ok, text = self.tron.buy(item_id)
             else:
                 ok, text = self.lzt.fast_buy(item_id, price)
-            site = "tronaccs" if is_tron else "lzt"
+            site = "tronaccs" if is_tron else "lzt.market"
             log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, user_id, ok, text)
             if ok:
                 self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
@@ -1103,7 +1103,7 @@ class Bot:
             meta = STATS["last_meta"]
             lines = [
                 f"Фильтр: {html.escape(self.cfg.site_url())}",
-                f"Источник: {self.cfg.source}, интервал: {self.cfg.poll_interval} с",
+                f"Источник lzt.market: {'API' if self.cfg.source == 'api' else 'страница сайта'}, проверка каждые {self.cfg.poll_interval} с",
                 "tronaccs: " + (("включён, фильтр: " + (html.escape(self.cfg.tron_filter) or "нет")) if self.tron else "выключен"),
                 f"Подписчиков: {subs}, запомнено лотов: {seen}",
                 f"Этот чат {'подписан ✅' if subscribed else 'не подписан'}",
@@ -1120,7 +1120,15 @@ class Bot:
                 if bal:
                     lines.append(f"Баланс tronaccs: {html.escape(bal)}")
             if meta:
-                lines.append("Ответ API: " + html.escape(", ".join(f"{k}={v}" for k, v in meta.items())))
+                parts = []
+                if meta.get("totalItems") is not None:
+                    parts.append(f"всего на маркете по фильтру: {meta['totalItems']}")
+                if meta.get("perPage") is not None:
+                    parts.append(f"на странице: {meta['perPage']}")
+                if meta.get("wasCached") is not None:
+                    parts.append("ответ из кэша: " + ("да" if meta["wasCached"] else "нет"))
+                if parts:
+                    lines.append("📡 lzt.market: " + html.escape(", ".join(parts)))
             if STATS["last_error"]:
                 lines.append(
                     f"⚠️ Последняя ошибка ({_ago(STATS['last_error_at'])}): "
@@ -1150,17 +1158,38 @@ class Bot:
 
 # ---------- форматирование ----------
 
-# Поля, которые уже выводятся отдельными строками
-KNOWN_TELEGRAM_KEYS = {
-    "telegram_country", "telegram_contacts", "telegram_contacts_count",
-    "telegram_spam_block", "telegram_premium", "telegram_chats_count",
-    "telegram_channels_count", "telegram_conversations_count",
+# Поля лота -> подпись по-русски. Порядок важен: так строки идут в сообщении.
+# Тип: "num" число, "bool" да/нет, "date" дата, "text" как есть, "spam" спамблок.
+FIELD_LABELS: list[tuple[tuple[str, ...], str, str]] = [
+    (("telegram_country",), "🌍 Страна", "text"),
+    (("telegram_contacts", "telegram_contacts_count"), "👥 Контакты", "num"),
+    (("telegram_spam_block",), "🚫 Спамблок", "spam"),
+    (("telegram_premium",), "⭐ Premium", "bool"),
+    (("telegram_premium_expires",), "⭐ Premium до", "date"),
+    (("telegram_password",), "🔐 Облачный пароль (2FA)", "bool"),
+    (("telegram_chats_count",), "💬 Чаты", "num"),
+    (("telegram_channels_count",), "📣 Каналы", "num"),
+    (("telegram_conversations_count",), "✉️ Диалоги", "num"),
+    (("telegram_admin_groups_count", "telegram_admin_chats_count"), "👑 Админ в группах", "num"),
+    (("telegram_admin_channels_count",), "👑 Админ в каналах", "num"),
+    (("telegram_stars_count", "telegram_stars"), "✨ Stars", "num"),
+    (("telegram_gifts_count", "telegram_gifts"), "🎁 Подарки", "num"),
+    (("telegram_nft_gifts_count", "telegram_nft_gifts"), "🎁 NFT-подарки", "num"),
+    (("telegram_raiting_level", "telegram_rating_level"), "🏅 Уровень рейтинга", "num"),
+    (("telegram_raiting_stars", "telegram_rating_stars"), "🏅 Звёзды рейтинга", "num"),
+    (("telegram_id_count", "telegram_id_length"), "🔢 Длина ID", "num"),
+    (("telegram_dc_id",), "🖥 Дата-центр", "num"),
+    (("telegram_reg_date", "telegram_register_date", "telegram_birthday"), "📅 Регистрация", "date"),
+    (("telegram_last_seen",), "👀 Был онлайн", "date"),
+    (("telegram_full_name",), "🙍 Имя в профиле", "text"),
+]
+ORIGIN_LABELS = {
+    "autoreg": "авторег", "self_registration": "саморег", "brute": "брут", "stealer": "стилер",
+    "personal": "личный", "resale": "перепродажа", "fishing": "фишинг", "retrive": "восстановленный",
+    "dummy": "пустышка", "phishing": "фишинг", "farm": "ферма",
 }
-# Служебные и потенциально чувствительные поля, их в чат не шлём
-HIDDEN_KEYS = {
-    "telegram_client", "telegram_json", "telegram_api_id", "telegram_api_hash",
-    "telegram_phone", "telegram_password", "telegram_id", "telegram_username",
-}
+MSK = timezone(timedelta(hours=3))
+
 
 def _first(item: dict, *keys: str):
     for key in keys:
@@ -1172,17 +1201,45 @@ def _first(item: dict, *keys: str):
 
 def _fmt_date(ts) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-    except (TypeError, ValueError, OSError):
+        ts = int(ts)
+        if ts > 10**11:  # миллисекунды
+            ts //= 1000
+        return datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M МСК")
+    except (TypeError, ValueError, OSError, OverflowError):
         return "?"
 
 
 def _yes_no(value) -> str:
-    if value in (True, 1, "1", "yes"):
-        return "да"
-    if value in (False, 0, "0", "no"):
-        return "нет"
-    return str(value)
+    if value in (True, 1, "1", "yes", "true"):
+        return "да ✅"
+    if value in (False, 0, "0", "no", "false"):
+        return "нет ❌"
+    return "неизвестно ❔"
+
+
+def _spam(value) -> str:
+    """lzt: 0 нет, 1 есть, -1 не проверялся; tronaccs: true/false."""
+    if value in (True, 1, "1", "yes", "true"):
+        return "есть ⛔"
+    if value in (False, 0, "0", "no", "false"):
+        return "нет ✅"
+    if value in (-1, "-1"):
+        return "не проверялся ❔"
+    return "неизвестно ❔"
+
+
+def _fmt_value(value, kind: str) -> str | None:
+    if kind == "bool":
+        return _yes_no(value)
+    if kind == "spam":
+        return _spam(value)
+    if kind == "date":
+        return _fmt_date(value)
+    if kind == "num":
+        if isinstance(value, bool):
+            return _yes_no(value)
+        return html.escape(str(value))
+    return html.escape(str(value))
 
 
 def format_item(item: dict) -> str:
@@ -1194,51 +1251,31 @@ def format_item(item: dict) -> str:
     currency = {"rub": "₽", "usd": "$", "eur": "€"}.get(currency, currency.upper())
     price_str = f"{price} {currency}" if price is not None else "?"
 
-    lines = [f"🆕 <b>{title}</b>", f"💰 Цена: <b>{html.escape(price_str)}</b>"]
+    site = "tronaccs" if item.get("source") == "tron" else "lzt.market"
+    lines = [f"🆕 <b>{title}</b>", f"🏪 {site}", f"💰 Цена: <b>{html.escape(price_str)}</b>"]
 
-    country = _first(item, "telegram_country")
-    if country:
-        lines.append(f"🌍 Страна: {html.escape(str(country))}")
-    contacts = _first(item, "telegram_contacts", "telegram_contacts_count")
-    if contacts is not None:
-        lines.append(f"👥 Контакты: {contacts}")
-    spam = _first(item, "telegram_spam_block")
-    if spam is not None:
-        lines.append(f"🚫 Спамблок: {_yes_no(spam)}")
-    premium = _first(item, "telegram_premium")
-    if premium is not None:
-        lines.append(f"⭐ Premium: {_yes_no(premium)}")
-    for label, keys in (
-        ("Чаты", ("telegram_chats_count",)),
-        ("Каналы", ("telegram_channels_count",)),
-        ("Диалоги", ("telegram_conversations_count",)),
-    ):
+    for keys, label, kind in FIELD_LABELS:
         value = _first(item, *keys)
-        if value is not None:
-            lines.append(f"• {label}: {value}")
-    # Остальные telegram_* поля выводим как есть: точный набор полей в
-    # спецификации API не типизирован, так ничего не потеряется.
-    for key in sorted(item):
-        if not key.startswith("telegram_") or key in KNOWN_TELEGRAM_KEYS or key in HIDDEN_KEYS:
+        if value is None or isinstance(value, (dict, list)):
             continue
-        value = item[key]
-        if value in (None, "", [], {}) or isinstance(value, (dict, list)):
-            continue
-        label = key[len("telegram_"):].replace("_", " ")
-        lines.append(f"• {html.escape(label)}: {html.escape(str(value))}")
+        text = _fmt_value(value, kind)
+        if text and text != "?":
+            lines.append(f"{label}: {text}")
     details = _first(item, "web_details")
     if details:
         lines.append(f"ℹ️ {html.escape(str(details))}")
     origin = _first(item, "item_origin")
     if origin:
-        lines.append(f"📦 Происхождение: {html.escape(str(origin))}")
+        origin_s = str(origin)
+        lines.append(f"📦 Происхождение: {html.escape(ORIGIN_LABELS.get(origin_s.lower(), origin_s))}")
+    seller = _first(item, "seller_username")
+    if seller:
+        lines.append(f"👤 Продавец: {html.escape(str(seller))}")
     published = _first(item, "published_date")
     if published:
         lines.append(f"🕒 Опубликован: {_fmt_date(published)}")
 
     lines.append(f"🔗 {item.get('url') or f'{MARKET_URL}/{item_id}'}")
-    if item.get("source") == "tron":
-        lines[0] = "🆕 <b>tronaccs</b> · " + lines[0][len("🆕 "):]
     return "\n".join(lines)
 
 

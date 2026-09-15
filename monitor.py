@@ -62,10 +62,11 @@ TG_API = "https://api.telegram.org"
 DEFAULT_QUERY = "country[]=UZ&min_contacts=100&spam=no"
 DEFAULT_TRON_FILTER = "country=UZ contacts>=100 spam=no"
 MAX_SEEN_IDS = 5000
-# Сортировка списка lzt. Сайт во вкладке «новые» сортирует по дате ЗАГРУЗКИ на маркет
-# (pdate_to_down_upload) — то самое «20 минут назад». Старое pdate_to_down сортировало по
-# исходной дате публикации, из-за чего заново поднятые лоты не попадали на первую страницу.
-LZT_ORDER_BY = os.getenv("LZT_ORDER_BY", "pdate_to_down_upload").strip() or "pdate_to_down_upload"
+# Сортировка списка lzt. pdate_to_down — по исходной ДАТЕ ПУБЛИКАЦИИ, новые сверху: свежие заливы
+# видны, а заново поднятое старьё (старая дата публикации) наверх не лезет — это и нужно.
+# pdate_to_down_upload — по дате поднятия на маркет (как вкладка «новые» на сайте), тянет наверх
+# и поднятые старые лоты. Переключается через .env.
+LZT_ORDER_BY = os.getenv("LZT_ORDER_BY", "pdate_to_down").strip() or "pdate_to_down"
 TELEGRAM_MESSAGE_LIMIT = 4096
 MSK = timezone(timedelta(hours=3))
 

@@ -685,18 +685,34 @@ def _decode_auth_key(value: str) -> bytes | None:
 
 
 def session_from_authkey(flat: dict) -> bytes | None:
-    """Собрать .session из отдельных полей auth_key + dc_id (формат tronaccs)."""
+    """Собрать .session из полей auth_key + dc_id (формат tronaccs: AUTHKEY, DCID)."""
     auth_key = dc_id = None
     for key, value in flat.items():
         low = key.lower().rsplit(".", 1)[-1]
-        if auth_key is None and isinstance(value, str) and ("auth" in low and "key" in low or low in ("authkey", "auth_key")):
-            auth_key = _decode_auth_key(value)
-        if dc_id is None and ("dc" in low and ("id" in low or low == "dc") or low in ("dcid", "dc_id")):
+        if not isinstance(value, str):
+            if dc_id is None and low in ("dcid", "dc_id"):
+                try:
+                    n = int(value)
+                    if 1 <= n <= 5:
+                        dc_id = n
+                except (TypeError, ValueError):
+                    pass
+            continue
+        v = value.strip()
+        # Совмещённое поле AUTHKEY:DCID вида "<hex512>:<dc>"
+        combo = re.fullmatch(r"([0-9a-fA-F]{512}):([1-5])", v)
+        if combo:
+            key_bytes = _decode_auth_key(combo.group(1))
+            if key_bytes:
+                return _make_telethon_session(int(combo.group(2)), TG_DC[int(combo.group(2))], 443, key_bytes)
+        if auth_key is None and ("auth" in low and "key" in low or low in ("authkey", "auth_key")):
+            auth_key = _decode_auth_key(v)
+        if dc_id is None and low in ("dcid", "dc_id"):
             try:
-                n = int(value)
+                n = int(v)
                 if 1 <= n <= 5:
                     dc_id = n
-            except (TypeError, ValueError):
+            except ValueError:
                 pass
     if not auth_key:
         return None

@@ -715,6 +715,7 @@ class Bot:
     )
     COUNTRIES = ["UZ", "RU", "KZ", "UA", "BY", "KG", "TJ", "US", "IN", "ID"]
     CONTACTS = [0, 50, 100, 200, 300, 500, 1000]
+    PRICES = [100, 200, 300, 500, 1000, 2000]
 
     def __init__(self, cfg: Config, state: State, tg: Telegram) -> None:
         self.cfg = cfg
@@ -775,10 +776,19 @@ class Bot:
         return s
 
     @staticmethod
-    def _label(s: dict) -> str:
+    def _price_text(s: dict) -> str:
+        lo, hi = s.get("price_min"), s.get("price_max")
+        if lo is None and hi is None:
+            return "любая"
+        if lo is not None and hi is not None:
+            return f"от {lo} до {hi} ₽"
+        return f"от {lo} ₽" if lo is not None else f"до {hi} ₽"
+
+    @classmethod
+    def _label(cls, s: dict) -> str:
         country = "любая" if s["country"] == "any" else s["country"]
         spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
-        return f"Страна: {country}\nКонтактов от: {s['contacts']}\nСпамблок: {spam}"
+        return f"Страна: {country}\nКонтактов от: {s['contacts']}\nСпамблок: {spam}\nЦена: {cls._price_text(s)}"
 
     def settings_keyboard(self, p: dict, view: str = "main") -> dict:
         s = self.current_settings(p)
@@ -804,12 +814,23 @@ class Bot:
                 {"text": ("✅ " if s["spam"] == "yes" else "") + "Со спамблоком", "callback_data": "set:spam:yes"},
                 {"text": ("✅ " if s["spam"] == "any" else "") + "Любой", "callback_data": "set:spam:any"},
             ], [{"text": "← Назад", "callback_data": "set:menu:0"}]]}
+        if view == "price":
+            lo, hi = s.get("price_min"), s.get("price_max")
+            row = [{"text": ("✅ " if hi == n else "") + f"до {n}", "callback_data": f"set:price_max:{n}"} for n in self.PRICES]
+            return {"inline_keyboard": [
+                row[:3], row[3:],
+                [{"text": f"✏️ От… ({lo if lo is not None else 'нет'})", "callback_data": "set:price_min:ask"},
+                 {"text": f"✏️ До… ({hi if hi is not None else 'нет'})", "callback_data": "set:price_max:ask"}],
+                [{"text": ("✅ " if lo is None and hi is None else "") + "Любая цена", "callback_data": "set:price_clear:0"},
+                 {"text": "← Назад", "callback_data": "set:menu:0"}],
+            ]}
         country = "любая" if s["country"] == "any" else s["country"]
         spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
         return {"inline_keyboard": [
             [{"text": f"🌍 Страна: {country}", "callback_data": "set:view:country"}],
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "set:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "set:view:spam"}],
+            [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "set:view:price"}],
             [{"text": ("✅" if s.get("lzt", True) else "☐") + " lzt.market", "callback_data": "set:site:lzt"},
              {"text": ("✅" if s.get("tron", True) else "☐") + " tronaccs", "callback_data": "set:site:tron"}],
             [{"text": "💾 Применить", "callback_data": "set:apply:0"}],
@@ -819,7 +840,8 @@ class Bot:
         s = self.current_settings(p)
         hints = {"main": "\n\nНажмите на строку, чтобы изменить. Потом «Применить».",
                  "country": "\n\nВыберите страну аккаунта.", "contacts": "\n\nМинимальное число контактов.",
-                 "spam": "\n\nСпамблок на аккаунте."}
+                 "spam": "\n\nСпамблок на аккаунте.",
+                 "price": "\n\nЦена в рублях. На tronaccs считается с комиссией."}
         return "⚙️ <b>Настройки фильтра</b>\n" + html.escape(self._label(s)) + hints.get(view, "")
 
     def show_settings(self, p: dict, chat_id: int, message_id: int | None = None, view: str = "main") -> None:
@@ -840,6 +862,10 @@ class Bot:
                 params.append(("min_contacts", str(s["contacts"])))
             if s["spam"] != "any":
                 params.append(("spam", s["spam"]))
+            if s.get("price_min") is not None:
+                params.append(("pmin", str(s["price_min"])))
+            if s.get("price_max") is not None:
+                params.append(("pmax", str(s["price_max"])))
             p["category"] = "telegram"
             p["query"] = "&".join(f"{k}={v}" for k, v in params)
             self.state.reset_seen(p, "lzt")
@@ -852,6 +878,10 @@ class Bot:
                 parts.append(f"contacts>={s['contacts']}")
             if s["spam"] != "any":
                 parts.append(f"spam={s['spam']}")
+            if s.get("price_min") is not None:
+                parts.append(f"price>={s['price_min']}")
+            if s.get("price_max") is not None:
+                parts.append(f"price<={s['price_max']}")
             p["tron_filter"] = " ".join(parts)
             self.state.reset_seen(p, "tron")
             applied.append("tronaccs: " + (html.escape(p["tron_filter"]) or "без фильтра")
@@ -900,6 +930,23 @@ class Bot:
             self.show_settings(p, chat_id, message_id, "main")
         elif kind == "spam":
             s["spam"] = value
+            self.state.save()
+            self.show_settings(p, chat_id, message_id, "main")
+        elif kind in ("price_min", "price_max"):
+            if value == "ask":
+                self.awaiting[chat_id] = (user_id, kind)
+                self.tg.answer_callback(cq_id)
+                self.tg.send(chat_id, ("Пришлите минимальную цену в рублях, например <code>100</code>."
+                                       if kind == "price_min" else
+                                       "Пришлите максимальную цену в рублях, например <code>500</code>.")
+                             + "\n0 — убрать это ограничение. Отмена: /settings")
+                return
+            s[kind] = int(value)
+            self.state.save()
+            self.show_settings(p, chat_id, message_id, "price")
+        elif kind == "price_clear":
+            s["price_min"] = None
+            s["price_max"] = None
             self.state.save()
             self.show_settings(p, chat_id, message_id, "main")
         elif kind == "site":
@@ -1216,6 +1263,12 @@ class Bot:
                 self.tg.send(chat_id, "Нужно число, например 150. Или /settings для отмены.")
                 return
             s["contacts"] = int(text.strip())
+        elif kind in ("price_min", "price_max"):
+            digits = text.strip().replace(" ", "")
+            if not digits.isdigit():
+                self.tg.send(chat_id, "Нужно число в рублях, например 500. 0 — убрать ограничение. Или /settings для отмены.")
+                return
+            s[kind] = int(digits) or None
         self.awaiting.pop(chat_id, None)
         self.state.save()
         self.show_settings(p, chat_id)

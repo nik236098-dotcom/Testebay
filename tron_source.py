@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -258,16 +259,20 @@ class TronApiClient:
 
     MIN_INTERVAL = 1.1  # сервер требует не чаще одного запроса в секунду
     _last_request_at = 0.0
+    _pace_lock = threading.Lock()  # общий на все экземпляры: монитор и бот ходят в API из разных потоков
 
     def _request(self, method: str, path: str, **kw):
         timeout = kw.pop("timeout", 30)
         for attempt in range(1, 6):
-            # Держим паузу между любыми запросами к tronaccs
-            wait = self._last_request_at + self.MIN_INTERVAL - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            resp = self.session.request(method, f"{TRON_API}{path}", timeout=timeout, **kw)
-            self._last_request_at = time.time()
+            # Держим паузу между любыми запросами к tronaccs, из какого бы потока они ни шли
+            with TronApiClient._pace_lock:
+                wait = TronApiClient._last_request_at + self.MIN_INTERVAL - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    resp = self.session.request(method, f"{TRON_API}{path}", timeout=timeout, **kw)
+                finally:
+                    TronApiClient._last_request_at = time.time()
             if resp.status_code == 401:
                 raise TronError("tronaccs: 401, проверьте TRON_TOKEN")
             try:

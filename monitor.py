@@ -286,6 +286,12 @@ def new_profile(user_id: int, name: str, chat_id: int | None, cfg: Config, with_
     }
 
 
+def _trim_list(lst: list, limit: int = MAX_SEEN_IDS) -> None:
+    """Оставляет последние limit элементов, не создавая новый список."""
+    if len(lst) > limit:
+        del lst[:-limit]
+
+
 class State:
     """Состояние на диске: профили пользователей, коды приглашений, смещение обновлений бота."""
 
@@ -346,17 +352,19 @@ class State:
     def save(self) -> None:
         with self.lock:
             for p in self.users.values():
+                # Списки урезаем НА МЕСТЕ: рассылка и AutoBuy держат ссылку на этот же список и
+                # дописывают в него между сохранениями; копия (срез) оставила бы их со старым объектом
                 for k in ("lzt", "tron"):
-                    p["seen"][k] = p["seen"][k][-MAX_SEEN_IDS:]
+                    _trim_list(p["seen"][k])
                 ab = p.get("autobuy") or {}
                 if ab:
                     autobuy_upgrade(ab)
                     for site in AUTOBUY_SITES:
-                        ab["seen"][site] = ab["seen"][site][-MAX_SEEN_IDS:]
+                        _trim_list(ab["seen"][site])
                     attempts = ab.get("attempts") or {}
                     if len(attempts) > MAX_SEEN_IDS:
-                        keep = sorted(attempts.items(), key=lambda kv: kv[1], reverse=True)[:MAX_SEEN_IDS]
-                        ab["attempts"] = dict(keep)
+                        for key, _ in sorted(attempts.items(), key=lambda kv: kv[1])[:len(attempts) - MAX_SEEN_IDS]:
+                            del attempts[key]
             data = {
                 "users": self.users,
                 "invites": self.invites,
@@ -2907,6 +2915,17 @@ class Bot:
                 lines.append(html.escape(self._label(ab_s)))
             except Exception:
                 pass
+            for site in ab.get("sources") or []:
+                r = st.get(f"ab_{site}")
+                if not r:
+                    lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: ещё не проверял")
+                elif r.get("error"):
+                    lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: ⚠️ {html.escape(str(r['error']))} ({_ago(r['at'])})")
+                elif r.get("quiet"):
+                    lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: запомнил {r.get('new', 0)} текущих лотов, покупаю следующие ({_ago(r['at'])})")
+                else:
+                    lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: новых {r.get('new', 0)}, куплено {r.get('bought', 0)}, "
+                                 f"не удалось {r.get('failed', 0)}, дороже лимита {r.get('skipped_price', 0)} ({_ago(r['at'])})")
         lines.append("\nСтарые аккаунты учитываются в результатах. Уведомления приходят только о новых.")
         keyboard = {"inline_keyboard": [
             [{"text": "🔄 Обновить статус", "callback_data": "nav:status"}, {"text": "🔎 Проверить сейчас", "callback_data": "nav:check"}],
@@ -3024,6 +3043,11 @@ def track_availability(bot: Bot, rt: UserRuntime, name: str, label: str, error: 
 
 def _check_user(bot: Bot, rt: UserRuntime) -> None:
     p, st = rt.profile, rt.stats
+    ab = p.get("autobuy") or {}
+    ab = autobuy_upgrade(ab) if ab.get("enabled") else None
+    ab_sites = set(ab["sources"]) if ab else set()
+    ab_s = (ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)) if ab else {}
+
     if rt.lzt is not None:
         items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]))
         st["checks"] += 1
@@ -3032,15 +3056,27 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         st["last_new"] = 0
         rt.record_error(rt.lzt.last_error)
         track_availability(bot, rt, "lzt", "lzt.market", rt.lzt.last_error)
-        rt.lzt.last_error = None
+        error, rt.lzt.last_error = rt.lzt.last_error, None
+        bought: set[int] = set()
+        if "lzt" in ab_sites:
+            # AutoBuy идёт ПЕРЕД рассылкой: пока лоты уходят в чаты по секунде на каждый, их скупают.
+            # Если условия AutoBuy совпадают с условиями поиска, второй запрос к сайту не нужен.
+            same = not error and lzt_params(p["query"]) == autobuy_lzt_params(ab_s)
+            bought = run_autobuy_site(bot, rt, ab, "lzt", items if same else None)
         if items:
             seen = p["seen"]["lzt"]
-            new_items = [i for i in items if int(i["item_id"]) not in seen]
+            new_items = [i for i in items if int(i["item_id"]) not in seen and int(i["item_id"]) not in bought]
+            for item_id in bought:
+                if item_id not in seen:
+                    seen.append(item_id)  # о купленном AutoBuy уже написал, второй раз с кнопкой не шлём
             st["last_new"] = len(new_items)
             log.info("%s/lzt: лотов %d, новых %d", p["user_id"], len(items), len(new_items))
             deliver_new(bot, rt, items, new_items, "lzt")
         else:
             log.warning("%s/lzt: лотов нет (ошибка или пустой фильтр)", p["user_id"])
+    elif "lzt" in ab_sites:
+        run_autobuy_site(bot, rt, ab, "lzt", None)
+
     if rt.tron is not None:
         items = rt.tron.fetch_items()
         st["tron_total"] = rt.tron.last_total
@@ -3048,19 +3084,32 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         st["tron_new"] = 0
         rt.record_error(rt.tron.last_error)
         track_availability(bot, rt, "tron", "tronaccs", rt.tron.last_error)
-        rt.tron.last_error = None
+        error, rt.tron.last_error = rt.tron.last_error, None
+        bought = set()
+        if "tron" in ab_sites:
+            same = not error and (p.get("tron_filter") or "") == autobuy_tron_filter(ab_s)
+            bought = run_autobuy_site(bot, rt, ab, "tron", items if same else None)
         if items:
             seen = p["seen"]["tron"]
-            new_items = [i for i in items if int(i["item_id"]) not in seen]
+            new_items = [i for i in items if int(i["item_id"]) not in seen and int(i["item_id"]) not in bought]
+            for item_id in bought:
+                if item_id not in seen:
+                    seen.append(item_id)
             st["tron_new"] = len(new_items)
             log.info("%s/tron: всего %d, под фильтр %d, новых %d", p["user_id"], rt.tron.last_total, len(items), len(new_items))
             deliver_new(bot, rt, items, new_items, "tron")
-    # >>> AutoBuy <<<
-    if p.get("autobuy", {}).get("enabled"):
-        try:
-            check_autobuy(bot, rt)
-        except Exception:  # noqa: BLE001
-            log.exception("autobuy: ошибка у пользователя %s", p["user_id"])
+    elif "tron" in ab_sites:
+        run_autobuy_site(bot, rt, ab, "tron", None)
+
+
+def run_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: list[dict] | None) -> set[int]:
+    """AutoBuy на одной площадке. items — уже полученный список (те же условия), иначе запрос свой.
+    Возвращает ID купленных лотов."""
+    try:
+        return _check_autobuy_site(bot, rt, ab, site, items)
+    except Exception:  # noqa: BLE001
+        log.exception("autobuy %s: ошибка у пользователя %s", site, rt.profile["user_id"])
+        return set()
 
 
 def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
@@ -3073,37 +3122,46 @@ def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
         return
     autobuy_upgrade(ab)
     for site in ab["sources"]:
-        try:
-            _check_autobuy_site(bot, rt, ab, site)
-        except Exception:  # noqa: BLE001
-            log.exception("autobuy %s: ошибка у пользователя %s", site, p["user_id"])
+        run_autobuy_site(bot, rt, ab, site, None)
 
 
-def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
+def _ab_report(rt: UserRuntime, site: str, **fields) -> None:
+    """Итог последней проверки AutoBuy по площадке — для /status и лога."""
+    rt.stats[f"ab_{site}"] = {"at": time.time(), **fields}
+
+
+def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: list[dict] | None = None) -> set[int]:
     p, state = rt.profile, bot.state
     s = ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)
     seen = ab["seen"][site]
     attempts = ab.setdefault("attempts", {})
     seen_set = set(seen)
     label = AUTOBUY_SITE_LABELS[site]
+    bought: set[int] = set()
 
-    if site == "lzt":
-        client = rt.lzt_ab
-        if client is None:
-            return
-        items = client.fetch_items(p.get("category") or "telegram",
-                                   autobuy_lzt_params(s), retries=2)
+    if items is None:
+        if site == "lzt":
+            client = rt.lzt_ab
+            if client is None:
+                _ab_report(rt, site, error="нет токена lzt.market или включён режим страницы")
+                return bought
+            items = client.fetch_items(p.get("category") or "telegram",
+                                       autobuy_lzt_params(s), retries=2)
+        else:
+            client = rt.tron_ab
+            if client is None:
+                _ab_report(rt, site, error="нет токена tronaccs")
+                return bought
+            items = client.fetch_items(retries=2)
         if client.last_error:
-            log.warning("%s/autobuy lzt: %s", p["user_id"], client.last_error)
-            return
+            log.warning("%s/autobuy %s: %s", p["user_id"], site, client.last_error)
+            _ab_report(rt, site, error=user_error(client.last_error))
+            return bought
     else:
-        client = rt.tron_ab
+        client = rt.lzt_ab if site == "lzt" else rt.tron_ab
         if client is None:
-            return
-        items = client.fetch_items(retries=2)
-        if client.last_error:
-            log.warning("%s/autobuy tron: %s", p["user_id"], client.last_error)
-            return
+            _ab_report(rt, site, error="нет токена для покупки на " + label)
+            return bought
 
     new_items = [i for i in items if int(i["item_id"]) not in seen_set]
 
@@ -3114,9 +3172,11 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
             seen.append(int(item["item_id"]))
         state.save()
         log.info("%s/autobuy %s: тихая инициализация, запомнил %d лотов", p["user_id"], site, len(new_items))
-        return
+        _ab_report(rt, site, new=len(new_items), quiet=True)
+        return bought
 
     new_items.sort(key=lambda i: int(i.get("published_date") or 0))
+    skipped_price = failed = 0
     for item in new_items:
         item_id = int(item["item_id"])
         seen.append(item_id)
@@ -3127,6 +3187,7 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
         if s.get("price_max") is not None and price is not None:
             try:
                 if float(price) > float(s["price_max"]):
+                    skipped_price += 1
                     continue
             except (TypeError, ValueError):
                 pass
@@ -3151,6 +3212,7 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
 
         chats = rt.chats
         if ok:
+            bought.add(item_id)
             if chats:
                 bot.tg.send_all(chats, f"🤖✅ <b>AutoBuy</b> купил лот {item_id} на {label}.\n\n"
                                        + format_item(item))
@@ -3160,6 +3222,7 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
             except Exception:
                 log.exception("autobuy: не удалось отправить файлы лота %d", item_id)
         else:
+            failed += 1
             if chats:
                 bot.tg.send_all(chats,
                     f"🤖❌ <b>AutoBuy</b>: не удалось купить лот {item_id} на {label}.\n"
@@ -3174,7 +3237,12 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
             ab["attempts"] = dict(keep)
             attempts = ab["attempts"]
         state.save()
-        time.sleep(1)
+
+    _ab_report(rt, site, new=len(new_items), bought=len(bought), failed=failed, skipped_price=skipped_price)
+    if new_items:
+        log.info("%s/autobuy %s: новых %d, куплено %d, не удалось %d, дороже лимита %d",
+                 p["user_id"], site, len(new_items), len(bought), failed, skipped_price)
+    return bought
 
 
 def main(argv: list[str]) -> int:

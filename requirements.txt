@@ -1,2 +1,4 @@
 requests>=2.31
 python-dotenv>=1.0
+# Необязательно: собрать .session из строковой сессии Telethon
+# telethon>=1.36

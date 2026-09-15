@@ -637,17 +637,41 @@ _B64_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]+$")
 
 
 def _maybe_binary(value: str) -> bytes | None:
-    """Если строка — base64 архива/файла (tdata обычно zip), вернуть его байты."""
+    """Если строка — base64 файла, вернуть (байты, расширение). Иначе None."""
     s = value.strip()
     if len(s) < 100 or not _B64_RE.match(s):
         return None
     try:
         raw = base64.b64decode(s, validate=False)
-    except (ValueError, Exception):  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         return None
-    if raw[:2] in (b"PK", b"\x1f\x8b") or raw[:4] == b"Rar!":  # zip, gzip, rar
-        return raw
+    if raw[:16].startswith(b"SQLite format 3"):  # готовый .session (Telethon/Pyrogram - SQLite)
+        return raw, "session"
+    if raw[:2] == b"PK" or raw[:4] == b"Rar!" or raw[:2] == b"\x1f\x8b":  # zip, rar, gzip
+        return raw, "zip"
     return None
+
+
+def stringsession_to_session(session_str: str) -> bytes | None:
+    """Строковую сессию Telethon -> настоящий .session (SQLite). Нужен пакет telethon."""
+    try:
+        import tempfile
+        from telethon.sessions import StringSession, SQLiteSession
+    except Exception:  # noqa: BLE001 - telethon не установлен
+        return None
+    try:
+        ss = StringSession(session_str)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s")
+            sql = SQLiteSession(path)
+            sql.set_dc(ss.dc_id, ss.server_address, ss.port)
+            sql.auth_key = ss.auth_key
+            sql.save()
+            sql.close()
+            with open(path + ".session", "rb") as f:
+                return f.read()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _flatten(data, prefix: str = "") -> dict[str, object]:
@@ -684,13 +708,12 @@ def build_account_files(item_id: int, data, downloader=None) -> tuple[list[tuple
         used_names.add(final)
         files.append((final, content))
 
-    # Полный ответ — всегда, чтобы ничего не потерять
-    add(f"{item_id}.json", json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-
     flat = _flatten(data)
     info_lines: list[str] = []
+    got_session = False
     for key, value in flat.items():
         low = key.lower()
+        short = key.split(".")[-1]
         # Короткие информационные поля
         for label, subs in INFO_KEYS.items():
             if any(low == s or low.endswith("." + s) for s in subs) and value not in (None, "", 0):
@@ -698,26 +721,45 @@ def build_account_files(item_id: int, data, downloader=None) -> tuple[list[tuple
                 break
         if not isinstance(value, str) or len(value) < 20:
             continue
-        # Ссылка на файл — скачиваем
+        # Ссылка на файл — скачиваем как есть (.session, .zip, .json)
         if value.startswith(("http://", "https://")) and downloader is not None:
             low_url = value.lower().split("?")[0]
-            if any(low_url.endswith(e) for e in (".zip", ".rar", ".session", ".json", ".7z")) or "download" in low_url:
+            if any(low_url.endswith(e) for e in (".session", ".zip", ".rar", ".7z", ".json")) or "download" in low_url:
                 blob = downloader(value)
                 if blob:
                     ext = low_url.rsplit(".", 1)[-1] if "." in low_url else "bin"
-                    add(f"{item_id}_{key.split('.')[-1]}.{ext}", blob)
+                    add(f"{item_id}.{ext}" if ext == "session" else f"{item_id}_{short}.{ext}", blob)
+                    got_session = got_session or ext == "session"
                 continue
-        # base64 архива (обычно tdata)
+        # base64 файла: .session (SQLite) или архив (tdata)
         binary = _maybe_binary(value)
         if binary is not None:
-            add(f"{item_id}_{key.split('.')[-1]}.zip", binary)
+            raw, ext = binary
+            if ext == "session":
+                add(f"{item_id}.session", raw)
+                got_session = True
+            else:
+                add(f"{item_id}_tdata.zip" if "tdata" in low else f"{item_id}_{short}.zip", raw)
             continue
-        # Известные текстовые сессии
+        # Строковая сессия -> пробуем собрать настоящий .session
+        if any(s in low for s in ("telethon", "session_string", "stringsession", "string_session")) or low.endswith("session"):
+            real = stringsession_to_session(value)
+            if real:
+                add(f"{item_id}.session", real)
+                got_session = True
+            else:
+                add(f"{item_id}_telethon_string.txt", value.encode("utf-8"))  # строка, не файл
+            continue
+        # Прочие известные форматы
         for label, subs in SESSION_KEYS.items():
             if any(s in low for s in subs):
                 ext = "json" if label == "json" else "txt"
                 add(f"{item_id}_{label}.{ext}", value.encode("utf-8"))
                 break
+
+    # Полный ответ прикладываем как запасной, если готового .session не нашлось
+    if not got_session:
+        add(f"{item_id}.json", json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 
     summary = "\n".join(dict.fromkeys(info_lines))  # без дублей, порядок сохранён
     return files, summary

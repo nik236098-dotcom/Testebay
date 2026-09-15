@@ -1,0 +1,9 @@
+services:
+  lzt-monitor:
+    build: .
+    env_file: .env
+    environment:
+      STATE_FILE: /data/state.json
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

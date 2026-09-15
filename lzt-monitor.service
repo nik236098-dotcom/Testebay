@@ -1,0 +1,18 @@
+# Пример systemd-юнита. Скопировать в /etc/systemd/system/lzt-monitor.service,
+# поправить пути, затем:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now lzt-monitor
+[Unit]
+Description=lzt.market new items monitor -> Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lzt-monitor
+EnvironmentFile=/opt/lzt-monitor/.env
+ExecStart=/opt/lzt-monitor/.venv/bin/python /opt/lzt-monitor/monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

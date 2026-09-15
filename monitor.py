@@ -340,8 +340,10 @@ class LztClient:
                 log.error("lzt вернул %d: %s", resp.status_code, resp.text[:300])
                 return []
             if resp.status_code >= 500:
+                # 5xx (чаще всего 503 на техработах) держится долго: одна повторная попытка,
+                # иначе проверка занимает замок минутами и /check не может вклиниться
                 self._err(f"lzt вернул {resp.status_code}")
-                if last:
+                if last or attempt >= 2:
                     return []
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
@@ -2068,7 +2070,9 @@ class Bot:
         """Ждём, пока закончится плановая проверка этого пользователя (если она идёт прямо сейчас)."""
         if rt.lock.acquire(timeout=wait):
             return True
-        self.tg.send(chat_id, "⏳ Сейчас идёт плановая проверка, сайт отвечает медленно. Попробуйте через минуту.")
+        err = rt.stats.get("last_error")
+        self.tg.send(chat_id, "⏳ Сейчас идёт плановая проверка, сайт отвечает медленно. Попробуйте через минуту."
+                     + (f"\nПоследняя ошибка ({_ago(rt.stats['last_error_at'])}): {html.escape(str(err))}" if err else ""))
         return False
 
     def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:

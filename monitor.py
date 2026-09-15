@@ -62,6 +62,10 @@ TG_API = "https://api.telegram.org"
 DEFAULT_QUERY = "country[]=UZ&min_contacts=100&spam=no"
 DEFAULT_TRON_FILTER = "country=UZ contacts>=100 spam=no"
 MAX_SEEN_IDS = 5000
+# Сортировка списка lzt. Сайт во вкладке «новые» сортирует по дате ЗАГРУЗКИ на маркет
+# (pdate_to_down_upload) — то самое «20 минут назад». Старое pdate_to_down сортировало по
+# исходной дате публикации, из-за чего заново поднятые лоты не попадали на первую страницу.
+LZT_ORDER_BY = os.getenv("LZT_ORDER_BY", "pdate_to_down_upload").strip() or "pdate_to_down_upload"
 TELEGRAM_MESSAGE_LIMIT = 4096
 MSK = timezone(timedelta(hours=3))
 
@@ -156,7 +160,7 @@ def parse_market_url(url: str) -> tuple[str, str]:
 def lzt_params(query: str) -> list[tuple[str, str]]:
     """Фильтры из ссылки + принудительная сортировка по дате публикации (новые сверху)."""
     params = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k not in ("order_by", "page")]
-    params.append(("order_by", "pdate_to_down"))
+    params.append(("order_by", LZT_ORDER_BY))
     return params
 
 
@@ -177,7 +181,7 @@ def autobuy_lzt_params(s: dict) -> list[tuple[str, str]]:
         params.append(("pmin", str(s["price_min"])))
     if s.get("price_max") is not None:
         params.append(("pmax", str(s["price_max"])))
-    params.append(("order_by", "pdate_to_down"))
+    params.append(("order_by", LZT_ORDER_BY))
     return params
 
 
@@ -2849,16 +2853,49 @@ class Bot:
         in_ab_seen = item_id in ((ab.get("seen") or {}).get("lzt") or []) if isinstance(ab.get("seen"), dict) else False
         if not self.acquire_check(rt, chat_id):
             return
+        # Проба идёт БЕЗ фильтра пользователя: цель — найти лот в списке категории вообще,
+        # отдельно от вопроса, проходит ли он фильтр (это проверяет by_filter выше).
+        def _probe(order: str, page: int):
+            prm: list[tuple[str, str]] = []
+            if order:
+                prm.append(("order_by", order))
+            if page > 1:
+                prm.append(("page", str(page)))
+            rt.lzt.last_error = None
+            got = rt.lzt.fetch_items(p["category"], prm, retries=1)
+            return got, rt.lzt.last_error
+
+        def _has(items: list) -> bool:
+            return any(int(i.get("item_id") or 0) == item_id for i in items)
+
+        probe_lines: list[str] = []
+        found_page = None
         try:
             detail = rt.lzt.account_data(item_id)
             rt.lzt.last_error = None
             by_filter = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
             err_filter, cached = rt.lzt.last_error, rt.lzt.last_meta.get("wasCached")
-            rt.lzt.last_error = None
-            no_filter = rt.lzt.fetch_items(p["category"], [("order_by", "pdate_to_down")], retries=1)
-            err_all = rt.lzt.last_error
+            no_filter, err_all = _probe("pdate_to_down", 1)
+            # Пробуем другие сортировки на первой странице и несколько страниц текущей сортировки
+            for order, lbl in (("pdate_to_down_upload", "по дате загрузки на маркет (новые сверху)"),
+                               ("", "сортировка API по умолчанию")):
+                got, e = _probe(order, 1)
+                probe_lines.append(("✅ " if _has(got) else "❌ ") + lbl + f": {len(got)} лотов"
+                                   + (f", ⚠️ {user_error(e)}" if e else ""))
+            for pg in (2, 3, 4, 5):
+                got, e = _probe("pdate_to_down", pg)
+                if e:
+                    probe_lines.append(f"страницы 2–5: ⚠️ {user_error(e)}")
+                    break
+                if _has(got):
+                    found_page = pg
+                    break
         finally:
             rt.lock.release()
+        if found_page:
+            probe_lines.append(f"✅ найден на странице {found_page} текущей сортировки (бот читает только первую)")
+        elif not any(l.startswith("страницы") for l in probe_lines):
+            probe_lines.append("❌ на страницах 2–5 текущей сортировки не найден")
         in_filter = any(int(i.get("item_id") or 0) == item_id for i in by_filter)
         in_all = any(int(i.get("item_id") or 0) == item_id for i in no_filter)
         if isinstance(detail, dict) and detail.get("item_id"):
@@ -2886,7 +2923,10 @@ class Bot:
         lines.append(("✅" if in_seen else "❌") + " в памяти бота как уже показанный")
         if ab.get("enabled"):
             lines.append(("✅" if in_ab_seen else "❌") + " в памяти AutoBuy как уже обработанный")
+        lines.append("\n<b>Проба сортировок и страниц:</b>")
+        lines.extend("   " + x for x in probe_lines)
         lines.append("\n<b>Вывод:</b>")
+        alt_hit = any(l.startswith("✅") and "маркет" in l for l in probe_lines)
         if in_filter and in_seen:
             lines.append("Бот его видит, но уже показывал раньше, поэтому молчит. Новые лоты присылаются один раз.")
         elif in_filter:
@@ -2902,9 +2942,16 @@ class Bot:
                              f"на {_fmt_date(oldest)}. Бот смотрит только первую страницу, поэтому такой лот для него не новый: "
                              "продавец, скорее всего, заново открыл старые лоты, а не залил новые. "
                              "На сайте они всплывают наверх по поднятию, а не по дате.")
+            elif alt_hit:
+                lines.append("Лот виден в сортировке «по дате загрузки на маркет», но не в той, что использует бот. "
+                             "Исправлю: переключу мониторинг на эту сортировку (можно и вручную: LZT_ORDER_BY).")
+            elif found_page:
+                lines.append(f"Лот есть в списке, но на странице {found_page}, а бот читает только первую. "
+                             "Исправлю: бот будет читать несколько страниц.")
             else:
-                lines.append("Лот в API есть, но в списках его ещё нет: у lzt список обновляется с задержкой, "
-                             "либо лот на проверке (см. item_state). Обычно появляется через несколько минут.")
+                lines.append("Лот в API есть, но списковый поиск его не отдаёт ни одной сортировкой и ни на одной "
+                             "из первых страниц. Это отставание поиска lzt от сайта. Тогда надёжнее читать сайт "
+                             "(SOURCE=web), как это делают быстрые скупщики.")
         else:
             lines.append("API этого лота не знает. Проверьте номер; если на сайте он есть, у API отставание.")
         self.tg.send(chat_id, "\n".join(lines))

@@ -38,6 +38,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode
 
 import requests
+from urllib.parse import urlparse
 
 from web_source import WebSourceError, fetch_items_web
 
@@ -109,6 +110,28 @@ class Config:
     def site_url(self) -> str:
         return f"{MARKET_URL}/{self.category}/?{self.query}"
 
+    def apply_state(self, state: "State") -> None:
+        """Фильтр, заданный через /filter, важнее значений из .env."""
+        if state.category and state.query is not None:
+            self.category = state.category
+            self.query = state.query
+
+
+def parse_market_url(url: str) -> tuple[str, str]:
+    """https://lzt.market/telegram/?country[]=UZ&spam=no -> ("telegram", "country[]=UZ&spam=no")."""
+    url = url.strip()
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host not in ("lzt.market", "www.lzt.market"):
+        raise ValueError("Нужна ссылка на lzt.market, например https://lzt.market/telegram/?spam=no")
+    category = parsed.path.strip("/").split("/")[0]
+    if not category or category.isdigit():
+        raise ValueError("В ссылке нет категории. Откройте раздел каталога (например /telegram/) и скопируйте адрес.")
+    query = parsed.query.strip()
+    return category, query
+
 
 class State:
     """Состояние на диске: просмотренные лоты, подписчики, смещение обновлений бота."""
@@ -120,6 +143,8 @@ class State:
         self.initialized = False
         self.subscribers: list[int] = []
         self.tg_offset = 0
+        self.category: str | None = None   # фильтр, заданный командой /filter
+        self.query: str | None = None
         self._load()
 
     def _load(self) -> None:
@@ -131,6 +156,8 @@ class State:
             self.initialized = bool(data.get("initialized", False))
             self.subscribers = [int(x) for x in data.get("subscribers", [])]
             self.tg_offset = int(data.get("tg_offset", 0))
+            self.category = data.get("category") or None
+            self.query = data.get("query")
         except (ValueError, OSError) as exc:
             log.warning("Не удалось прочитать %s: %s. Начинаю с пустого состояния.", self.path, exc)
 
@@ -142,6 +169,8 @@ class State:
                 "initialized": self.initialized,
                 "subscribers": self.subscribers,
                 "tg_offset": self.tg_offset,
+                "category": self.category,
+                "query": self.query,
             }
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -169,6 +198,15 @@ class State:
             self.subscribers.remove(chat_id)
             self.save()
             return True
+
+    def set_filter(self, category: str, query: str) -> None:
+        """Новый фильтр: старые лоты забываем, первая проверка пройдёт молча."""
+        with self.lock:
+            self.category = category
+            self.query = query
+            self.seen_ids = []
+            self.initialized = False
+            self.save()
 
 
 class LztClient:
@@ -305,6 +343,8 @@ class Bot:
         "/start — подписаться на новые лоты\n"
         "/stop — отписаться\n"
         "/status — что мониторится и сколько лотов запомнено\n"
+        "/filter <ссылка> — сменить фильтр: пришлите адрес страницы lzt.market с нужными фильтрами\n"
+        "/filter — показать текущий фильтр\n"
         "/id — показать ваш Telegram ID"
     )
 
@@ -325,7 +365,9 @@ class Bot:
         text = (msg.get("text") or "").strip()
         if chat_id is None or not text.startswith("/"):
             return
-        command = text.split()[0].split("@")[0].lower()
+        parts = text.split(maxsplit=1)
+        command = parts[0].split("@")[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
 
         if command == "/id":
             self.tg.send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>\nID этого чата: <code>{chat_id}</code>")
@@ -349,6 +391,28 @@ class Bot:
                 self.tg.send(chat_id, "🔕 Отписал. Чтобы вернуть уведомления — /start")
             else:
                 self.tg.send(chat_id, "Вы и так не подписаны. Подписаться — /start")
+        elif command == "/filter":
+            if not arg:
+                self.tg.send(
+                    chat_id,
+                    "Текущий фильтр:\n" + html.escape(self.cfg.site_url())
+                    + "\n\nЧтобы сменить, пришлите:\n<code>/filter https://lzt.market/telegram/?country[]=UZ&amp;spam=no</code>",
+                )
+                return
+            try:
+                category, query = parse_market_url(arg)
+            except ValueError as exc:
+                self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+                return
+            self.cfg.category = category
+            self.cfg.query = query
+            self.state.set_filter(category, query)
+            log.info("Фильтр изменён пользователем %s: %s", user_id, self.cfg.site_url())
+            self.tg.send(
+                chat_id,
+                "✅ Фильтр обновлён:\n" + html.escape(self.cfg.site_url())
+                + "\n\nТекущие лоты по нему запомню молча, дальше буду присылать только новые.",
+            )
         elif command == "/status":
             with self.state.lock:
                 subs = len(self.state.subscribers)
@@ -530,6 +594,7 @@ def main(argv: list[str]) -> int:
 
     tg = Telegram(cfg.tg_bot_token)
     state = State(cfg.state_file)
+    cfg.apply_state(state)
     if cfg.tg_chat_id:
         state.subscribe(int(cfg.tg_chat_id))
 

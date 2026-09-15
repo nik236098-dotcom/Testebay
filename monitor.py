@@ -2823,7 +2823,10 @@ class Bot:
                     if not items:
                         lines.append("Ничего не найдено. Проверьте страну, контакты и ограничение цены.")
                         continue
-                    latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:CHECK_SHOW_ITEMS]
+                    # API уже отдаёт список в порядке LZT_ORDER_BY (по дате загрузки на маркет —
+                    # как «новые» на сайте). Берём первые как есть, не пересортировывая по дате публикации:
+                    # у заново поднятых лотов дата публикации старая, и сортировка по ней их прятала.
+                    latest = items[:CHECK_SHOW_ITEMS]
                     lines.append(f"Последние {len(latest)} — отдельными сообщениями ниже, с кнопкой «Купить».")
                     to_send.extend(latest)
             finally:

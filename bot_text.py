@@ -1,5 +1,7 @@
 """Human-readable service errors and Telegram-safe message formatting."""
 
+from __future__ import annotations
+
 import html
 import json
 import re

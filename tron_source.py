@@ -34,6 +34,19 @@ TRON_API = "https://system-api.tronaccs.market"
 TRON_SITE = "https://tronaccs.market"
 
 
+def _readable(data, limit: int = 200) -> str:
+    """Ошибка tronaccs человеческой строкой вместо словаря: {"message": "…"} -> "…"."""
+    if isinstance(data, dict):
+        msgs = data.get("message") or data.get("error") or data.get("errors") or data.get("result") or data
+        if isinstance(msgs, dict):
+            msgs = list(msgs.values())
+        msgs = msgs if isinstance(msgs, list) else [msgs]
+        return "; ".join(str(m) for m in msgs if m)[:limit]
+    text = str(data or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())[:limit]
+
+
 class TronError(RuntimeError):
     pass
 
@@ -289,7 +302,7 @@ class TronApiClient:
             try:
                 data = resp.json()
             except ValueError:
-                raise TronError(f"tronaccs: HTTP {resp.status_code}, ответ не JSON: {resp.text[:200]}")
+                raise TronError(f"tronaccs: HTTP {resp.status_code}: {_readable(resp.text) or 'пустой ответ'}")
             message = str((data.get("message") if isinstance(data, dict) else "") or "")
             limited = resp.status_code == 429 or "Попробуйте через" in message or "Превышено количество" in message
             if limited and attempt < retries:
@@ -299,7 +312,7 @@ class TronApiClient:
                 time.sleep(delay + 0.3)
                 continue
             if resp.status_code >= 400:
-                raise TronError(f"tronaccs: HTTP {resp.status_code}: {str(data)[:200]}")
+                raise TronError(f"tronaccs: HTTP {resp.status_code}: {_readable(data)}")
             return data
         raise TronError("tronaccs: лимит запросов не снимается, попробуйте позже")
 
@@ -343,7 +356,7 @@ class TronApiClient:
         for page in range(1, self.max_pages + 1):
             data = self.fetch_raw_page(page, params, retries=retries)
             if isinstance(data, dict) and str(data.get("status", "ok")).lower() not in ("ok", "true", "success", "1"):
-                raise TronError(f"tronaccs: {data.get('result') or data.get('message') or data}")
+                raise TronError(f"tronaccs: {_readable(data)}")
             raw_list = data.get("items") if isinstance(data, dict) else data
             if not isinstance(raw_list, list) or not raw_list:
                 break

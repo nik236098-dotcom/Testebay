@@ -279,17 +279,26 @@ class State:
 
 # ---------- клиенты сайтов ----------
 
-def _body_snippet(resp, limit: int = 120) -> str:
-    """Короткий текст ответа для сообщения об ошибке: у HTML-страниц (DDoS-Guard, заглушка
-    техработ) убираем теги, чтобы было видно, кто именно ответил."""
+def _errors_text(data) -> str:
+    """Текст ошибки из JSON маркета: {"errors": ["…"]}, {"message": "…"} и т.п. — человеческой строкой."""
+    if isinstance(data, dict):
+        msgs = data.get("errors") or data.get("error") or data.get("message") or data.get("result")
+        if isinstance(msgs, dict):
+            msgs = list(msgs.values())
+        msgs = msgs if isinstance(msgs, list) else [msgs]
+        return "; ".join(str(m) for m in msgs if m)
+    if isinstance(data, list):
+        return "; ".join(str(m) for m in data if m)
+    return str(data or "")
+
+
+def _body_snippet(resp, limit: int = 150, with_server: bool = True) -> str:
+    """Короткий читаемый текст ответа для сообщения об ошибке: из JSON берём поле errors/message
+    (без экранированных кодов символов), у HTML-страниц (DDoS-Guard, заглушка техработ) убираем теги."""
     text = resp.text or ""
-    server = resp.headers.get("Server", "")
-    try:  # JSON вида {"errors": ["Технические работы…"]} показываем текстом, а не \uXXXX
-        data = json.loads(text)
-        if isinstance(data, dict):
-            msgs = data.get("errors") or data.get("message") or data.get("error")
-            msgs = msgs if isinstance(msgs, list) else [msgs]
-            text = "; ".join(str(m) for m in msgs if m) or text
+    server = resp.headers.get("Server", "") if with_server else ""
+    try:
+        text = _errors_text(json.loads(text)) or text
     except ValueError:
         pass
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
@@ -324,7 +333,7 @@ class LztClient:
         if resp.status_code in (401, 403):
             return False, "Маркет не принял токен (401/403)"
         if resp.status_code >= 400:
-            return False, f"HTTP {resp.status_code}: {resp.text[:150]}"
+            return False, f"HTTP {resp.status_code}: {_body_snippet(resp, with_server=False)}"
         user = data.get("user") if isinstance(data, dict) else None
         if isinstance(user, dict):
             return True, f"{user.get('username') or user.get('user_id')}, баланс {user.get('balance')} ₽"
@@ -355,8 +364,8 @@ class LztClient:
                 backoff = min(backoff * 2, 60)
                 continue
             if resp.status_code in (401, 403):
-                self._err(f"lzt {resp.status_code}: проверьте токен. {resp.text[:150]}")
-                log.error("lzt вернул %d: %s", resp.status_code, resp.text[:300])
+                self._err(f"lzt {resp.status_code}: проверьте токен. {_body_snippet(resp, with_server=False)}")
+                log.error("lzt вернул %d: %s", resp.status_code, _body_snippet(resp, limit=300))
                 return []
             if resp.status_code >= 500:
                 # 5xx (чаще всего 503 на техработах) держится долго: одна повторная попытка,
@@ -368,15 +377,15 @@ class LztClient:
                 backoff = min(backoff * 2, 60)
                 continue
             if resp.status_code >= 400:
-                self._err(f"lzt {resp.status_code}: {resp.text[:150]}")
+                self._err(f"lzt {resp.status_code}: {_body_snippet(resp, with_server=False)}")
                 return []
             try:
                 data = resp.json()
             except ValueError:
-                self._err(f"lzt: ответ не JSON: {resp.text[:150]}")
+                self._err(f"lzt: ответ не JSON: {_body_snippet(resp)}")
                 return []
             if isinstance(data, dict) and data.get("errors"):
-                self._err(f"lzt: {data['errors']}")
+                self._err(f"lzt: {_errors_text(data)}")
                 return []
             items = data.get("items", []) if isinstance(data, dict) else []
             if isinstance(data, dict):
@@ -400,7 +409,7 @@ class LztClient:
         if errors:
             return False, "; ".join(str(e) for e in errors)
         if resp.status_code >= 400:
-            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return False, f"HTTP {resp.status_code}: {_body_snippet(resp, with_server=False)}"
         item = data.get("item") if isinstance(data, dict) else None
         if isinstance(item, dict) and item.get("item_state") not in (None, "paid", "sold"):
             return False, f"Маркет вернул состояние лота: {item.get('item_state')}"

@@ -40,6 +40,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 import requests
 
+from bot_text import display_value, readable, split_html, user_error
+
 from tron_source import TronApiClient, TronError, build_params, match_filter, parse_filter
 from web_source import WebSourceError, fetch_items_web
 
@@ -289,16 +291,8 @@ class State:
 # ---------- клиенты сайтов ----------
 
 def _errors_text(data) -> str:
-    """Текст ошибки из JSON маркета: {"errors": ["…"]}, {"message": "…"} и т.п. — человеческой строкой."""
-    if isinstance(data, dict):
-        msgs = data.get("errors") or data.get("error") or data.get("message") or data.get("result")
-        if isinstance(msgs, dict):
-            msgs = list(msgs.values())
-        msgs = msgs if isinstance(msgs, list) else [msgs]
-        return "; ".join(str(m) for m in msgs if m)
-    if isinstance(data, list):
-        return "; ".join(str(m) for m in data if m)
-    return str(data or "")
+    """Unwrap nested service errors without Python container syntax."""
+    return readable(data)
 
 
 def _body_snippet(resp, limit: int = 150, with_server: bool = True) -> str:
@@ -345,7 +339,7 @@ class LztClient:
             return False, f"HTTP {resp.status_code}: {_body_snippet(resp, with_server=False)}"
         user = data.get("user") if isinstance(data, dict) else None
         if isinstance(user, dict):
-            return True, f"{user.get('username') or user.get('user_id')}, баланс {user.get('balance')} ₽"
+            return True, f"{display_value(user.get('username') or user.get('user_id'), 'пользователь')}, баланс {display_value(user.get('balance'), 'недоступен')} ₽"
         return True, "ок"
 
     def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
@@ -416,7 +410,7 @@ class LztClient:
             data = {}
         errors = data.get("errors") if isinstance(data, dict) else None
         if errors:
-            return False, "; ".join(str(e) for e in errors)
+            return False, _errors_text(errors)
         if resp.status_code >= 400:
             return False, f"HTTP {resp.status_code}: {_body_snippet(resp, with_server=False)}"
         item = data.get("item") if isinstance(data, dict) else None
@@ -495,7 +489,7 @@ class TronClient:
             return False, str(exc)
         if not user:
             return False, "Пустой ответ /me"
-        return True, f"{user.get('username')}, баланс {user.get('balance')} {str(user.get('currency') or '').upper()}"
+        return True, f"{display_value(user.get('username'), 'пользователь')}, баланс {display_value(user.get('balance'), 'недоступен')} {str(user.get('currency') or '').upper()}"
 
     def fetch_items(self, retries: int = 5) -> list[dict]:
         try:
@@ -519,8 +513,8 @@ class TronClient:
         try:
             user = self.api.me()
         except (TronError, requests.RequestException) as exc:
-            return f"ошибка: {exc}"
-        return f"{user.get('balance')} {str(user.get('currency') or '').upper()}".strip() if user else None
+            return user_error(exc)
+        return f"{display_value(user.get('balance'), 'недоступен')} {str(user.get('currency') or '').upper()}".strip() if user else None
 
     def find_country_id(self, code: str, max_id: int = 300, progress=None) -> int | None:
         code = code.upper()
@@ -580,11 +574,15 @@ class Telegram:
         return None
 
     def send(self, chat_id: int | str, text: str, reply_markup: dict | None = None) -> bool:
-        payload = {"chat_id": chat_id, "text": text[:TELEGRAM_MESSAGE_LIMIT], "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        return self.call("sendMessage", payload) is not None
+        chunks = split_html(text, TELEGRAM_MESSAGE_LIMIT)
+        for index, chunk in enumerate(chunks):
+            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}
+            if reply_markup and index == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup
+            if self.call("sendMessage", payload) is None:
+                return False
+        return bool(chunks)
 
     def send_all(self, chat_ids: list[int], text: str, reply_markup: dict | None = None) -> int:
         return sum(1 for c in list(chat_ids) if self.send(c, text, reply_markup))
@@ -613,11 +611,15 @@ class Telegram:
         return False
 
     def edit_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
-        payload = {"chat_id": chat_id, "message_id": message_id, "text": text[:TELEGRAM_MESSAGE_LIMIT],
-                   "parse_mode": "HTML", "disable_web_page_preview": True}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
+        chunks = split_html(text, TELEGRAM_MESSAGE_LIMIT)
+        if not chunks:
+            return
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": chunks[0],
+                   "parse_mode": "HTML", "disable_web_page_preview": True,
+                   "reply_markup": reply_markup if len(chunks) == 1 and reply_markup else {"inline_keyboard": []}}
         self.call("editMessageText", payload)
+        for index, chunk in enumerate(chunks[1:], start=1):
+            self.send(chat_id, chunk, reply_markup if index == len(chunks) - 1 else None)
 
     def edit_markup(self, chat_id: int, message_id: int, reply_markup: dict | None) -> None:
         self.call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id,
@@ -1181,7 +1183,7 @@ class Bot:
         "/token — показать или сменить токены API\n"
         "/panel — автозагрузка купленной сессии во внешнюю панель\n"
         "/eva — EVA TG: автозалив архива .session после покупки\n"
-        "/filter <ссылка> — фильтр lzt.market ссылкой с сайта\n"
+        "/filter &lt;ссылка&gt; — фильтр lzt.market ссылкой с сайта\n"
         "/tron on|off, /tronfilter … — tronaccs вручную\n"
         "/tronid UZ — узнать ID страны на tronaccs\n"
         "/lztdump, /trondump — лот в сыром виде, как отдаёт сайт\n"
@@ -1192,7 +1194,7 @@ class Bot:
         "\n\nКоманды владельца:\n"
         "/invite [код] — создать одноразовый код доступа\n"
         "/users — список пользователей\n"
-        "/kick <id> — удалить пользователя"
+        "/kick &lt;id&gt; — удалить пользователя"
     )
     COUNTRIES = ["UZ", "RU", "KZ", "UA", "BY", "KG", "TJ", "US", "IN", "ID"]
     CONTACTS = [0, 50, 100, 200, 300, 500, 1000]
@@ -1205,7 +1207,8 @@ class Bot:
         self.runtimes: dict[int, UserRuntime] = {}
         self.awaiting: dict[int, tuple[int, str]] = {}  # chat_id -> (user_id, что ждём текстом)
         self.jobs: dict[tuple[int, str], threading.Thread] = {}  # (user_id, команда) -> поток
-        self.jobs_lock = threading.Lock()
+        self.jobs_lock = threading.RLock()
+        self.flow_lock = threading.RLock()
         for p in list(state.users.values()):
             self.runtime(p["user_id"])
 
@@ -1224,7 +1227,7 @@ class Bot:
                     target(*args)
                 except Exception:  # noqa: BLE001
                     log.exception("Ошибка в команде %s пользователя %s", name, user_id)
-                    self.tg.send(chat_id, f"⚠️ Команда {name} завершилась с ошибкой, подробности в логе.")
+                    self.tg.send(chat_id, "⚠️ Не удалось выполнить команду. Попробуйте ещё раз или откройте /help.")
 
             job = threading.Thread(target=runner, name=f"cmd-{name.lstrip('/').replace(' ', '_')}-{user_id}", daemon=True)
             self.jobs[key] = job
@@ -1556,10 +1559,10 @@ class Bot:
         log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, rt.profile["user_id"], ok, text)
         if ok:
             self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
-                                  f"{html.escape(text)}\n{item_url}")
+                                  f"{item_url}")
             self.send_account_files(rt, chat_id, item_id, site)
         else:
-            self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(text)}\n{item_url}",
+            self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(user_error(text))}\n{item_url}",
                          self.item_keyboard(rt, item, "buy"))
 
     def send_account_files(self, rt: UserRuntime, chat_id: int, item_id: int, site: str) -> None:
@@ -1605,8 +1608,8 @@ class Bot:
             for name, content in sessions:
                 ok2, info = upload_session(url, prof.get("upload_token") or "", prof.get("upload_field") or "file", name, content)
                 log.info("panel upload %s: %s — %s", name, ok2, info)
-                self.tg.send(chat_id, (f"⬆️ Панель: {name} загружен. {html.escape(info)}" if ok2
-                                       else f"⚠️ Панель: {name} не загрузился. {html.escape(info)}"))
+                self.tg.send(chat_id, (f"⬆️ Панель: {name} загружен." if ok2
+                                       else f"⚠️ Панель: {name} не загрузился. {html.escape(user_error(info))}"))
 
         # Автозалив архива .session в EVA TG (spammer-api)
         if sessions and prof.get("eva_auto") and prof.get("eva_token"):
@@ -1618,8 +1621,8 @@ class Bot:
                 run_spam=bool(prof.get("eva_run_spam", True)),
             )
             log.info("eva tg upload для лота %s: %s — %s", item_id, ok3, info3)
-            self.tg.send(chat_id, (f"📤 EVA TG: {html.escape(info3)}" if ok3
-                                   else f"⚠️ EVA TG: не залилось — {html.escape(info3)}"))
+            self.tg.send(chat_id, (f"📤 EVA TG: {html.escape(readable(info3))}" if ok3
+                                   else f"⚠️ EVA TG: не загрузилось — {html.escape(user_error(info3))}"))
 
     # --- регистрация и токены ---
 
@@ -1635,40 +1638,58 @@ class Bot:
                               "Если lzt не нужен, напишите /skip")
 
     def receive_token(self, p: dict, chat_id: int, kind: str, text: str, message_id: int | None) -> None:
-        token = text.strip()
         if message_id:
-            self.tg.delete(chat_id, message_id)  # токен в чате лучше не оставлять
+            self.tg.delete(chat_id, message_id)
+        if not text.strip():
+            self.tg.send(chat_id, "Пришлите токен текстовым сообщением или /skip для отмены.")
+            return
+        with self.jobs_lock:
+            job = self.jobs.get((p["user_id"], "/token"))
+            if job is not None and job.is_alive():
+                self.tg.send(chat_id, "⏳ Уже проверяю токен. Дождитесь результата.")
+                return
+            pending = (p["user_id"], kind)
+            self.awaiting[chat_id] = pending
+            self.tg.send(chat_id, "⏳ Проверяю ключ доступа… Можно отменить командой /settings.")
+            self.run_in_background(p["user_id"], "/token", chat_id,
+                                   self._receive_token, p, chat_id, kind, text, None, pending)
+
+    def _receive_token(self, p: dict, chat_id: int, kind: str, text: str,
+                       message_id: int | None, pending: tuple) -> None:
+        token = text.strip()
+        site = "lzt.market" if kind == "lzt_token" else "tronaccs"
         if kind == "lzt_token":
             client = LztClient(token)
-            ok, info = client.check_token()
-            if not ok:
-                self.tg.send(chat_id, "❌ lzt.market не принял токен: " + html.escape(info) + "\nПришлите ещё раз или /skip")
-                return
-            p["lzt_token"] = token
-            p["source"] = "api"
-            self.state.save()
-            self.tg.send(chat_id, "✅ Токен lzt.market принят: " + html.escape(info))
-            if not p.get("tron_token"):
-                self.awaiting[chat_id] = (p["user_id"], "tron_token")
-                self.tg.send(chat_id, "Шаг 2 из 2. Пришлите токен API <b>tronaccs.market</b>.\n"
-                                      "Где взять: на сайте нажмите на ник → «API TronAccs» → создать токен.\n"
-                                      "Если tronaccs не нужен, напишите /skip")
-                return
         else:
-            try:
-                client = TronClient(token, "", self.state.country_ids, self.cfg.tron_category, 1)
-            except ValueError:
-                client = None
-            ok, info = client.check_token() if client else (False, "ошибка")
-            if not ok:
-                self.tg.send(chat_id, "❌ tronaccs не принял токен: " + html.escape(info) + "\nПришлите ещё раз или /skip")
+            client = TronClient(token, "", self.state.country_ids, self.cfg.tron_category, 1)
+        ok, info = client.check_token()
+        with self.flow_lock:
+            if self.awaiting.get(chat_id) is not pending or self.profile(p["user_id"]) is not p:
                 return
-            p["tron_token"] = token
-            p["tron_enabled"] = True
-            self.state.save()
-            self.tg.send(chat_id, "✅ Токен tronaccs принят: " + html.escape(info))
-        self.awaiting.pop(chat_id, None)
-        self.finish_setup(p, chat_id)
+            next_step = False
+            if ok:
+                p[kind] = token
+                if kind == "lzt_token":
+                    p["source"] = "api"
+                    next_step = not p.get("tron_token")
+                else:
+                    p["tron_enabled"] = True
+                if next_step:
+                    self.awaiting[chat_id] = (p["user_id"], "tron_token")
+                else:
+                    self.awaiting.pop(chat_id, None)
+                self.state.save()
+        if not ok:
+            self.tg.send(chat_id, f"❌ Не удалось проверить ключ {site}: " + html.escape(user_error(info))
+                         + "\nПришлите ещё раз или /skip")
+            return
+        self.tg.send(chat_id, f"✅ Токен {site} принят: " + html.escape(info))
+        if next_step:
+            self.tg.send(chat_id, "Шаг 2 из 2. Пришлите токен API <b>tronaccs.market</b>.\n"
+                                  "Где взять: на сайте нажмите на ник → «API TronAccs» → создать токен.\n"
+                                  "Если tronaccs не нужен, напишите /skip")
+        else:
+            self.finish_setup(p, chat_id)
 
     def finish_setup(self, p: dict, chat_id: int) -> None:
         rt = self.runtime(p["user_id"])
@@ -1680,6 +1701,10 @@ class Bot:
     # --- обработка обновлений ---
 
     def handle(self, update: dict) -> None:
+        with self.flow_lock:
+            self._handle(update)
+
+    def _handle(self, update: dict) -> None:
         if update.get("callback_query"):
             self.handle_callback(update["callback_query"])
             return
@@ -2009,7 +2034,7 @@ class Bot:
         try:
             category, query = parse_market_url(arg)
         except ValueError as exc:
-            self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
             return
         p["category"], p["query"] = category, query
         p["settings"] = {}
@@ -2050,7 +2075,7 @@ class Bot:
         try:
             parse_filter(text)
         except ValueError as exc:
-            self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
             return
         p["tron_filter"] = text
         p["settings"] = {}
@@ -2092,7 +2117,7 @@ class Bot:
         try:
             cid = rt.tron.find_country_id(code, progress=lambda n: self.tg.send(chat_id, f"…проверил {n} ID"))
         except (TronError, requests.RequestException) as exc:
-            self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
             return
         if cid is None:
             self.tg.send(chat_id, f"Не нашёл ID для {code}. Можно подсмотреть на сайте и вписать: /tronid {code} <число>")
@@ -2109,7 +2134,7 @@ class Bot:
             return True
         err = rt.stats.get("last_error")
         self.tg.send(chat_id, "⏳ Сейчас идёт плановая проверка, сайт отвечает медленно. Попробуйте через минуту."
-                     + (f"\nПоследняя ошибка ({_ago(rt.stats['last_error_at'])}): {html.escape(str(err))}" if err else ""))
+                     + (f"\nПоследняя ошибка ({_ago(rt.stats['last_error_at'])}): {html.escape(user_error(err))}" if err else ""))
         return False
 
     def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
@@ -2129,7 +2154,7 @@ class Bot:
                     err = rt.lzt.last_error
                     rt.record_error(err)
                     self.tg.send(chat_id, "lzt.market: по фильтру ничего не найдено"
-                                 + (f" или сайт не ответил: {html.escape(err)}" if err else "."))
+                                 + (f" или сайт не ответил: {html.escape(user_error(err))}" if err else "."))
                 else:
                     latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
                     self.tg.send(chat_id, f"lzt.market: лотов на первой странице {len(items)}. Последние:")
@@ -2142,7 +2167,7 @@ class Bot:
                     err = rt.tron.last_error
                     rt.record_error(err)
                     self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр не подошёл ни один"
-                                 + (f". Сайт не ответил: {html.escape(err)}" if err else ". Поля лота: /trondump"))
+                                 + (f". Сайт не ответил: {html.escape(user_error(err))}" if err else ". Поля лота: /trondump"))
                 else:
                     self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр подходят {len(items)}. Последние:")
                     for item in items[:3]:
@@ -2162,7 +2187,7 @@ class Bot:
             rt.lock.release()
         if not items:
             self.tg.send(chat_id, "lzt.market: лотов нет или сайт не ответил"
-                         + (f": {html.escape(rt.lzt.last_error)}" if rt.lzt.last_error else "."))
+                         + (f": {html.escape(user_error(rt.lzt.last_error))}" if rt.lzt.last_error else "."))
             return
         raw = {k: v for k, v in items[0].items() if not isinstance(v, (dict, list))}
         self.tg.send(chat_id, "lzt.market: первый лот как отдаёт API:\n<pre>"
@@ -2177,7 +2202,7 @@ class Bot:
         try:
             raw, count = rt.tron.fetch_raw_sample()
         except (TronError, requests.RequestException) as exc:
-            self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
             return
         finally:
             rt.lock.release()
@@ -2222,7 +2247,7 @@ class Bot:
             else:
                 lines.append(f"⚠️ {label}: последняя проверка с ошибкой")
         if st["last_error"]:
-            lines.append(f"⚠️ Последняя ошибка ({_ago(st['last_error_at'])}): " + html.escape(str(st["last_error"])))
+            lines.append(f"⚠️ Последняя ошибка ({_ago(st['last_error_at'])}): " + html.escape(user_error(st["last_error"])))
         self.tg.send(chat_id, "\n".join(lines))
 
     def run_forever(self) -> None:
@@ -2236,6 +2261,13 @@ class Bot:
                         self.handle(update)
                     except Exception:  # noqa: BLE001
                         log.exception("Ошибка при обработке команды")
+                        message = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+                        chat_id = (message.get("chat") or {}).get("id")
+                        if chat_id is not None:
+                            try:
+                                self.tg.send(chat_id, "⚠️ Не удалось выполнить команду. Попробуйте ещё раз или откройте /help.")
+                            except Exception:
+                                log.exception("Не удалось сообщить об ошибке команды")
                 if updates:
                     self.state.save()
             except Exception:  # noqa: BLE001
@@ -2403,3 +2435,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+

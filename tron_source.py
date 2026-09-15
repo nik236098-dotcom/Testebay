@@ -26,6 +26,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from bot_text import readable
+
 import requests
 
 log = logging.getLogger("lzt-monitor.tron")
@@ -35,16 +37,7 @@ TRON_SITE = "https://tronaccs.market"
 
 
 def _readable(data, limit: int = 200) -> str:
-    """Ошибка tronaccs человеческой строкой вместо словаря: {"message": "…"} -> "…"."""
-    if isinstance(data, dict):
-        msgs = data.get("message") or data.get("error") or data.get("errors") or data.get("result") or data
-        if isinstance(msgs, dict):
-            msgs = list(msgs.values())
-        msgs = msgs if isinstance(msgs, list) else [msgs]
-        return "; ".join(str(m) for m in msgs if m)[:limit]
-    text = str(data or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    return " ".join(text.split())[:limit]
+    return readable(data)[:limit]
 
 
 class TronError(RuntimeError):
@@ -395,3 +388,4 @@ class TronApiClient:
         text = str((data.get("result") if isinstance(data, dict) else None) or data)[:300]
         ok = status is True or str(status).lower() in ("ok", "true", "success", "1")
         return ok, text if ok else (text or "Маркет отказал в покупке")
+

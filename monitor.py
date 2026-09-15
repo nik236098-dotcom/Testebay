@@ -2211,6 +2211,16 @@ class Bot:
             bal = rt.tron.balance()
             if bal:
                 lines.append(f"💳 Баланс tronaccs: {html.escape(bal)}")
+        for name, label, client in (("lzt", "lzt.market", rt.lzt), ("tron", "tronaccs", rt.tron)):
+            if client is None or f"{name}_last_ok" not in st:
+                continue
+            since = st.get(f"{name}_down_since")
+            if since:
+                lines.append(f"⛔ {label} не отвечает уже {_duration(time.time() - since)}")
+            elif st[f"{name}_last_ok"]:
+                lines.append(f"✅ {label} отвечает")
+            else:
+                lines.append(f"⚠️ {label}: последняя проверка с ошибкой")
         if st["last_error"]:
             lines.append(f"⚠️ Последняя ошибка ({_ago(st['last_error_at'])}): " + html.escape(str(st["last_error"])))
         self.tg.send(chat_id, "\n".join(lines))
@@ -2276,22 +2286,26 @@ def check_user(bot: Bot, rt: UserRuntime) -> None:
 
 
 DOWN_AFTER_FAILS = 2  # столько плановых проверок подряд с ошибкой = сайт «лёг»
+UP_AFTER_OKS = 2      # столько удачных проверок подряд после этого = сайт «встал» (один проскочивший запрос не считаем)
 
 
 def track_availability(bot: Bot, rt: UserRuntime, name: str, label: str, error: str | None) -> None:
     """Пока сайт не отвечает — молчим (ошибка видна в /status и в логе). Когда снова ответил
     после DOWN_AFTER_FAILS и более неудачных проверок подряд — одно сообщение «снова работает»."""
     st = rt.stats
-    since_key, fails_key = f"{name}_down_since", f"{name}_fails"
+    since_key, fails_key, oks_key = f"{name}_down_since", f"{name}_fails", f"{name}_oks"
+    st[f"{name}_last_ok"] = not error
     if error:
         st[fails_key] = st.get(fails_key, 0) + 1
+        st[oks_key] = 0
         if st.get(since_key) is None and st[fails_key] >= DOWN_AFTER_FAILS:
             st[since_key] = time.time()
             log.warning("%s/%s: сайт не отвечает: %s", rt.profile["user_id"], name, error)
         return
     st[fails_key] = 0
+    st[oks_key] = st.get(oks_key, 0) + 1
     since = st.get(since_key)
-    if since is not None:
+    if since is not None and st[oks_key] >= UP_AFTER_OKS:
         st[since_key] = None
         log.info("%s/%s: сайт снова отвечает", rt.profile["user_id"], name)
         bot.tg.send_all(rt.chats, f"🟢 {label} снова работает, не отвечал {_duration(time.time() - since)}. "

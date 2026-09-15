@@ -1033,9 +1033,20 @@ class Bot:
                     self.state.save()
                 self.tg.send(chat_id, "Список ID стран очищен.")
                 return
+            manual = re.fullmatch(r"([A-Z]{2})[\s=:]+(\d+)", code)
+            if manual:  # ID подсмотрен на сайте вручную: /tronid UZ 123
+                code, cid = manual.group(1), int(manual.group(2))
+                with self.state.lock:
+                    self.state.country_ids[code] = cid
+                    self.state.save()
+                self.tron.set_filter(self.cfg.tron_filter, self.state.country_ids)
+                log.info("tronaccs: страна %s = ID %d (вручную)", code, cid)
+                self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил, фильтр по стране уходит на сервер tronaccs. Проверить: /check")
+                return
             if not re.fullmatch(r"[A-Z]{2}", code):
                 known = ", ".join(f"{k}={v}" for k, v in sorted(self.state.country_ids.items())) or "пока нет"
-                self.tg.send(chat_id, "Пришлите код страны: <code>/tronid UZ</code>\nИзвестные ID: " + html.escape(known))
+                self.tg.send(chat_id, "Найти перебором: <code>/tronid UZ</code>\nВписать вручную: <code>/tronid UZ 123</code>\n"
+                                      "Известные ID: " + html.escape(known))
                 return
             if code in self.state.country_ids:
                 self.tg.send(chat_id, f"{code} = ID {self.state.country_ids[code]} (уже известен). Искать заново: сначала /tronid reset")

@@ -13,7 +13,9 @@
     USE_BROWSER      - (web) "1" чтобы грузить страницу через Playwright/Chromium
     LZT_TOKEN        - (api) токен API Lolzteam (https://lolz.live/account/api)
     TG_BOT_TOKEN     - токен Telegram-бота от @BotFather
-    TG_CHAT_ID       - id чата, куда слать уведомления (python get_chat_id.py)
+    TG_USER_ID       - (необязательно) ваш Telegram ID; если задан, бот отвечает
+                       только вам. Иначе подписаться может любой, кто напишет /start
+    TG_CHAT_ID       - (необязательно) чат, который подписан сразу, без /start
     LZT_CATEGORY     - категория, по умолчанию "telegram"
     LZT_QUERY        - строка фильтров из ссылки, по умолчанию
                        "country[]=UZ&min_contacts=100&spam=no"
@@ -29,6 +31,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +67,9 @@ class Config:
         self.use_browser = os.getenv("USE_BROWSER", "0") == "1"
         self.tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
         self.tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+        self.tg_user_ids = {
+            int(x) for x in os.getenv("TG_USER_ID", "").replace(";", ",").split(",") if x.strip().lstrip("-").isdigit()
+        }
         self.category = os.getenv("LZT_CATEGORY", "telegram").strip().strip("/")
         self.query = os.getenv("LZT_QUERY", DEFAULT_QUERY).strip().lstrip("?")
         self.poll_interval = max(5, int(os.getenv("POLL_INTERVAL", "60")))
@@ -73,7 +79,7 @@ class Config:
     def validate(self) -> None:
         if self.source not in ("api", "web"):
             raise SystemExit("SOURCE должен быть 'web' или 'api'")
-        required = [("TG_BOT_TOKEN", self.tg_bot_token), ("TG_CHAT_ID", self.tg_chat_id)]
+        required = [("TG_BOT_TOKEN", self.tg_bot_token)]
         if self.source == "api":
             required.append(("LZT_TOKEN", self.lzt_token))
         missing = [name for name, value in required if not value]
@@ -105,10 +111,15 @@ class Config:
 
 
 class State:
+    """Состояние на диске: просмотренные лоты, подписчики, смещение обновлений бота."""
+
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.lock = threading.RLock()
         self.seen_ids: list[int] = []
         self.initialized = False
+        self.subscribers: list[int] = []
+        self.tg_offset = 0
         self._load()
 
     def _load(self) -> None:
@@ -118,17 +129,23 @@ class State:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.seen_ids = [int(x) for x in data.get("seen_ids", [])]
             self.initialized = bool(data.get("initialized", False))
+            self.subscribers = [int(x) for x in data.get("subscribers", [])]
+            self.tg_offset = int(data.get("tg_offset", 0))
         except (ValueError, OSError) as exc:
             log.warning("Не удалось прочитать %s: %s. Начинаю с пустого состояния.", self.path, exc)
 
     def save(self) -> None:
-        self.seen_ids = self.seen_ids[-MAX_SEEN_IDS:]
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps({"seen_ids": self.seen_ids, "initialized": self.initialized}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        tmp.replace(self.path)
+        with self.lock:
+            self.seen_ids = self.seen_ids[-MAX_SEEN_IDS:]
+            data = {
+                "seen_ids": self.seen_ids,
+                "initialized": self.initialized,
+                "subscribers": self.subscribers,
+                "tg_offset": self.tg_offset,
+            }
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
 
     def is_seen(self, item_id: int) -> bool:
         return item_id in self.seen_ids
@@ -136,6 +153,22 @@ class State:
     def mark_seen(self, item_id: int) -> None:
         if item_id not in self.seen_ids:
             self.seen_ids.append(item_id)
+
+    def subscribe(self, chat_id: int) -> bool:
+        with self.lock:
+            if chat_id in self.subscribers:
+                return False
+            self.subscribers.append(chat_id)
+            self.save()
+            return True
+
+    def unsubscribe(self, chat_id: int) -> bool:
+        with self.lock:
+            if chat_id not in self.subscribers:
+                return False
+            self.subscribers.remove(chat_id)
+            self.save()
+            return True
 
 
 class LztClient:
@@ -208,21 +241,20 @@ class WebClient:
 
 
 class Telegram:
-    def __init__(self, bot_token: str, chat_id: str) -> None:
-        self.url = f"{TG_API}/bot{bot_token}/sendMessage"
-        self.chat_id = chat_id
+    def __init__(self, bot_token: str) -> None:
+        self.base = f"{TG_API}/bot{bot_token}"
         self.session = requests.Session()
 
-    def send(self, text: str) -> bool:
+    def send(self, chat_id: int | str, text: str) -> bool:
         payload = {
-            "chat_id": self.chat_id,
+            "chat_id": chat_id,
             "text": text[:TELEGRAM_MESSAGE_LIMIT],
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         for attempt in range(1, 4):
             try:
-                resp = self.session.post(self.url, json=payload, timeout=30)
+                resp = self.session.post(f"{self.base}/sendMessage", json=payload, timeout=30)
             except requests.RequestException as exc:
                 log.warning("Telegram: ошибка сети (попытка %d): %s", attempt, exc)
                 time.sleep(3 * attempt)
@@ -237,6 +269,117 @@ class Telegram:
             log.error("Telegram: ответ %d: %s", resp.status_code, resp.text[:300])
             return False
         return False
+
+    def send_all(self, chat_ids: list[int], text: str) -> int:
+        """Отправить всем подписчикам. Возвращает число успешных отправок."""
+        ok = 0
+        for chat_id in list(chat_ids):
+            if self.send(chat_id, text):
+                ok += 1
+        return ok
+
+    def get_updates(self, offset: int, timeout: int = 30) -> list[dict]:
+        try:
+            resp = self.session.get(
+                f"{self.base}/getUpdates",
+                params={"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'},
+                timeout=timeout + 10,
+            )
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Telegram: getUpdates не удался: %s", exc)
+            time.sleep(5)
+            return []
+        if not data.get("ok"):
+            log.error("Telegram: getUpdates вернул ошибку: %s", str(data)[:300])
+            time.sleep(5)
+            return []
+        return data.get("result", [])
+
+
+class Bot:
+    """Обработка команд в личке: /start подписывает чат, /stop отписывает."""
+
+    HELP = (
+        "Команды:\n"
+        "/start — подписаться на новые лоты\n"
+        "/stop — отписаться\n"
+        "/status — что мониторится и сколько лотов запомнено\n"
+        "/id — показать ваш Telegram ID"
+    )
+
+    def __init__(self, cfg: Config, state: State, tg: Telegram) -> None:
+        self.cfg = cfg
+        self.state = state
+        self.tg = tg
+
+    def allowed(self, user_id: int) -> bool:
+        return not self.cfg.tg_user_ids or user_id in self.cfg.tg_user_ids
+
+    def handle(self, update: dict) -> None:
+        msg = update.get("message") or {}
+        chat = msg.get("chat") or {}
+        user = msg.get("from") or {}
+        chat_id = chat.get("id")
+        user_id = user.get("id")
+        text = (msg.get("text") or "").strip()
+        if chat_id is None or not text.startswith("/"):
+            return
+        command = text.split()[0].split("@")[0].lower()
+
+        if command == "/id":
+            self.tg.send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>\nID этого чата: <code>{chat_id}</code>")
+            return
+        if not self.allowed(user_id):
+            log.info("Отказ пользователю %s (чат %s): нет в TG_USER_ID", user_id, chat_id)
+            self.tg.send(chat_id, "⛔ Этот бот приватный. Доступ только владельцу.")
+            return
+
+        if command == "/start":
+            if self.state.subscribe(chat_id):
+                self.tg.send(
+                    chat_id,
+                    "✅ Подписал. Буду присылать новые лоты по фильтру:\n"
+                    + html.escape(self.cfg.site_url()) + "\n\n" + self.HELP,
+                )
+            else:
+                self.tg.send(chat_id, "Вы уже подписаны.\n\n" + self.HELP)
+        elif command == "/stop":
+            if self.state.unsubscribe(chat_id):
+                self.tg.send(chat_id, "🔕 Отписал. Чтобы вернуть уведомления — /start")
+            else:
+                self.tg.send(chat_id, "Вы и так не подписаны. Подписаться — /start")
+        elif command == "/status":
+            with self.state.lock:
+                subs = len(self.state.subscribers)
+                seen = len(self.state.seen_ids)
+                subscribed = chat_id in self.state.subscribers
+            self.tg.send(
+                chat_id,
+                f"Фильтр: {html.escape(self.cfg.site_url())}\n"
+                f"Источник: {self.cfg.source}, интервал: {self.cfg.poll_interval} с\n"
+                f"Подписчиков: {subs}, запомнено лотов: {seen}\n"
+                f"Этот чат {'подписан ✅' if subscribed else 'не подписан'}",
+            )
+        else:
+            self.tg.send(chat_id, self.HELP)
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                updates = self.tg.get_updates(self.state.tg_offset)
+                for update in updates:
+                    with self.state.lock:
+                        self.state.tg_offset = max(self.state.tg_offset, int(update["update_id"]) + 1)
+                    try:
+                        self.handle(update)
+                    except Exception:  # noqa: BLE001
+                        log.exception("Ошибка при обработке команды")
+                if updates:
+                    self.state.save()
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка в цикле бота")
+                time.sleep(5)
 
 
 # ---------- форматирование ----------
@@ -352,10 +495,20 @@ def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Tele
     # Самые старые сначала, чтобы сообщения шли в хронологическом порядке
     new_items.sort(key=lambda i: int(i.get("published_date") or 0))
 
+    with state.lock:
+        subscribers = list(state.subscribers)
+    if not subscribers:
+        if new_items:
+            log.warning("Никто не подписан: напишите боту /start. Пропускаю %d лотов", len(new_items))
+            for item in new_items:
+                state.mark_seen(int(item["item_id"]))
+            state.save()
+        return 0
+
     sent = 0
     for item in new_items:
         item_id = int(item["item_id"])
-        if tg.send(format_item(item)):
+        if tg.send_all(subscribers, format_item(item)):
             sent += 1
             log.info("Отправлен лот %d (%s)", item_id, item.get("price"))
         else:
@@ -375,11 +528,19 @@ def main(argv: list[str]) -> int:
     cfg = Config()
     cfg.validate()
 
-    tg = Telegram(cfg.tg_bot_token, cfg.tg_chat_id)
+    tg = Telegram(cfg.tg_bot_token)
+    state = State(cfg.state_file)
+    if cfg.tg_chat_id:
+        state.subscribe(int(cfg.tg_chat_id))
 
     if "--test" in argv:
-        ok = tg.send("✅ Монитор lzt.market подключён.\nСлежу за: " + html.escape(cfg.site_url()))
-        print("Тестовое сообщение отправлено" if ok else "Не удалось отправить тестовое сообщение")
+        with state.lock:
+            subscribers = list(state.subscribers)
+        if not subscribers:
+            print("Подписчиков нет: напишите боту /start (запустите monitor.py) или задайте TG_CHAT_ID")
+            return 1
+        ok = tg.send_all(subscribers, "✅ Монитор lzt.market подключён.\nСлежу за: " + html.escape(cfg.site_url()))
+        print(f"Тестовое сообщение отправлено в {ok} из {len(subscribers)} чатов")
         return 0 if ok else 1
 
     if cfg.source == "api":
@@ -394,11 +555,16 @@ def main(argv: list[str]) -> int:
         print(f"\nВсего лотов на первой странице: {len(items)}")
         return 0
 
-    state = State(cfg.state_file)
+    # Бот принимает /start и /stop в отдельном потоке, монитор крутится в основном
+    bot = Bot(cfg, state, tg)
+    threading.Thread(target=bot.run_forever, name="telegram-bot", daemon=True).start()
 
     log.info(
-        "Слежу за %s каждые %d с (источник: %s)", cfg.site_url(), cfg.poll_interval, cfg.source
+        "Слежу за %s каждые %d с (источник: %s). Подписчиков: %d",
+        cfg.site_url(), cfg.poll_interval, cfg.source, len(state.subscribers),
     )
+    if not state.subscribers:
+        log.info("Напишите боту /start в Telegram, чтобы получать уведомления")
     once = "--once" in argv
     while True:
         try:

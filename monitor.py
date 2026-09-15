@@ -1665,7 +1665,7 @@ class Bot:
             new_query = "&".join(f"{k}={v}" for k, v in params)
             # Память лотов сбрасываем только если фильтр реально изменился: иначе повторное
             # «Сохранить» делало следующую проверку молчаливой и глотало всё, что появилось за минуту
-            if (p.get("category"), p.get("query")) != ("telegram", new_query) or not p["init"].get("lzt"):
+            if (p.get("category"), p.get("query")) != ("telegram", new_query):
                 p["category"], p["query"] = "telegram", new_query
                 self.state.reset_seen(p, "lzt")
                 changed = True
@@ -1682,7 +1682,7 @@ class Bot:
             if s.get("price_max") is not None:
                 parts.append(f"price<={s['price_max']}")
             new_filter = " ".join(parts)
-            if p.get("tron_filter") != new_filter or not p["init"].get("tron"):
+            if (p.get("tron_filter") or "") != new_filter:
                 p["tron_filter"] = new_filter
                 self.state.reset_seen(p, "tron")
                 changed = True

@@ -2875,6 +2875,14 @@ class Bot:
                      + (" — ответ из кэша" if cached else ""))
         lines.append(("✅" if in_all else "❌") + " в общей выдаче категории без фильтра, первая страница"
                      + (f" (ошибка: {html.escape(user_error(err_all))})" if err_all else ""))
+        if no_filter:
+            dates = [int(i.get("published_date") or 0) for i in no_filter]
+            meta = rt.lzt.last_meta or {}
+            lines.append(f"   на первой странице {len(no_filter)} лотов (на странице по API: {meta.get('perPage') or '?'}, "
+                         f"всего в категории: {meta.get('totalItems') or '?'}), даты публикации от {_fmt_date(min(dates))} "
+                         f"до {_fmt_date(max(dates))}, из кэша: {'да' if meta.get('wasCached') else 'нет'}")
+            states = sorted({str(i.get("item_state")) for i in no_filter})
+            lines.append("   состояния лотов на странице (item_state): " + html.escape(", ".join(states)))
         lines.append(("✅" if in_seen else "❌") + " в памяти бота как уже показанный")
         if ab.get("enabled"):
             lines.append(("✅" if in_ab_seen else "❌") + " в памяти AutoBuy как уже обработанный")

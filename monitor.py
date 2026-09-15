@@ -311,21 +311,27 @@ class LztClient:
             return True, f"{user.get('username') or user.get('user_id')}, баланс {user.get('balance')} ₽"
         return True, "ок"
 
-    def fetch_items(self, category: str, params: list[tuple[str, str]]) -> list[dict]:
+    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
+        """retries=1 — один быстрый запрос без пауз (для команд из чата), 5 — с повторами (для монитора)."""
         url = f"{API_BASE}/{category}"
         backoff = 5
-        for attempt in range(1, 6):
+        for attempt in range(1, retries + 1):
+            last = attempt >= retries
             try:
                 resp = self.session.get(url, params=params, timeout=30)
             except requests.RequestException as exc:
                 log.warning("lzt: ошибка сети (попытка %d): %s", attempt, exc)
                 self._err(f"сеть: {exc}")
+                if last:
+                    return []
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", backoff))
                 self._err("lzt: превышен лимит запросов (429)")
+                if last:
+                    return []
                 time.sleep(retry_after)
                 backoff = min(backoff * 2, 60)
                 continue
@@ -335,6 +341,8 @@ class LztClient:
                 return []
             if resp.status_code >= 500:
                 self._err(f"lzt вернул {resp.status_code}")
+                if last:
+                    return []
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
@@ -406,7 +414,7 @@ class WebClient:
         self.last_error: str | None = None
         self.last_meta: dict = {}
 
-    def fetch_items(self, category: str, params: list[tuple[str, str]]) -> list[dict]:
+    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
         try:
             return fetch_items_web(category, urlencode(params), self.cookies, self.use_browser, self.session)
         except (WebSourceError, requests.RequestException) as exc:
@@ -450,9 +458,9 @@ class TronClient:
             return False, "Пустой ответ /me"
         return True, f"{user.get('username')}, баланс {user.get('balance')} {str(user.get('currency') or '').upper()}"
 
-    def fetch_items(self) -> list[dict]:
+    def fetch_items(self, retries: int = 5) -> list[dict]:
         try:
-            items = self.api.fetch_items(self.params)
+            items = self.api.fetch_items(self.params, retries=retries)
         except (TronError, requests.RequestException) as exc:
             self.last_error = str(exc)[:300]
             log.error("%s", exc)
@@ -463,7 +471,7 @@ class TronClient:
         return items
 
     def fetch_raw_sample(self) -> tuple[dict | None, int]:
-        data = self.api.fetch_raw_page(1, self.params)
+        data = self.api.fetch_raw_page(1, self.params, retries=1)
         raw = data.get("items") if isinstance(data, dict) else data
         raw = raw if isinstance(raw, list) else []
         return (raw[0] if raw else (data if isinstance(data, dict) else None)), len(raw)
@@ -1092,6 +1100,9 @@ class UserRuntime:
         self.stats: dict = {"checks": 0, "last_check_at": None, "last_items": None, "last_new": 0,
                             "tron_total": None, "tron_items": None, "tron_new": 0,
                             "last_error": None, "last_error_at": None}
+        # Плановая проверка и /check ходят к сайтам из разных потоков; одновременно — нельзя
+        # (одна requests.Session на обоих, да и второй запрос подряд ловит 429).
+        self.lock = threading.Lock()
         self.rebuild()
 
     def rebuild(self) -> None:
@@ -1154,8 +1165,31 @@ class Bot:
         self.tg = tg
         self.runtimes: dict[int, UserRuntime] = {}
         self.awaiting: dict[int, tuple[int, str]] = {}  # chat_id -> (user_id, что ждём текстом)
+        self.jobs: dict[tuple[int, str], threading.Thread] = {}  # (user_id, команда) -> поток
+        self.jobs_lock = threading.Lock()
         for p in list(state.users.values()):
             self.runtime(p["user_id"])
+
+    def run_in_background(self, user_id: int, name: str, chat_id: int, target, *args) -> None:
+        """Команды, которые ходят к сайтам, выполняем в отдельном потоке: иначе, пока сайт
+        думает или отдаёт 429, бот не отвечает никому и не обрабатывает кнопки."""
+        key = (user_id, name)
+        with self.jobs_lock:
+            job = self.jobs.get(key)
+            if job is not None and job.is_alive():
+                self.tg.send(chat_id, f"⏳ Команда {name} уже выполняется, подождите ответа.")
+                return
+
+            def runner() -> None:
+                try:
+                    target(*args)
+                except Exception:  # noqa: BLE001
+                    log.exception("Ошибка в команде %s пользователя %s", name, user_id)
+                    self.tg.send(chat_id, f"⚠️ Команда {name} завершилась с ошибкой, подробности в логе.")
+
+            job = threading.Thread(target=runner, name=f"cmd-{name.lstrip('/')}-{user_id}", daemon=True)
+            self.jobs[key] = job
+            job.start()
 
     # --- доступ ---
 
@@ -1676,37 +1710,19 @@ class Bot:
         elif command == "/filter":
             self.cmd_filter(p, chat_id, arg)
         elif command == "/check":
-            self.cmd_check(p, rt, chat_id)
+            self.run_in_background(user_id, command, chat_id, self.cmd_check, p, rt, chat_id)
         elif command == "/status":
-            self.cmd_status(p, rt, chat_id)
+            self.run_in_background(user_id, command, chat_id, self.cmd_status, p, rt, chat_id)
         elif command == "/tron":
             self.cmd_tron(p, rt, chat_id, arg)
         elif command == "/tronfilter":
             self.cmd_tronfilter(p, rt, chat_id, arg)
         elif command == "/tronid":
-            self.cmd_tronid(p, rt, chat_id, arg)
+            self.run_in_background(user_id, command, chat_id, self.cmd_tronid, p, rt, chat_id, arg)
         elif command == "/lztdump":
-            items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"])) if rt and rt.lzt else []
-            if not items:
-                self.tg.send(chat_id, "lzt.market: лотов нет, нет токена или сайт не ответил. Подробности в /status.")
-                return
-            raw = {k: v for k, v in items[0].items() if not isinstance(v, (dict, list))}
-            self.tg.send(chat_id, "lzt.market: первый лот как отдаёт API:\n<pre>"
-                         + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
+            self.run_in_background(user_id, command, chat_id, self.cmd_lztdump, p, rt, chat_id)
         elif command == "/trondump":
-            if not rt or rt.tron is None:
-                self.tg.send(chat_id, "tronaccs выключен или нет токена. /tron on, /token tron")
-                return
-            try:
-                raw, count = rt.tron.fetch_raw_sample()
-            except (TronError, requests.RequestException) as exc:
-                self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
-                return
-            if raw is None:
-                self.tg.send(chat_id, "tronaccs вернул пустой список.")
-                return
-            self.tg.send(chat_id, f"tronaccs: лотов на первой странице {count}. Первый как есть:\n<pre>"
-                         + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
+            self.run_in_background(user_id, command, chat_id, self.cmd_trondump, p, rt, chat_id)
         elif command == "/invite" and self.is_owner(user_id):
             code = arg.strip() or secrets.token_urlsafe(6)
             if " " in code:
@@ -2041,30 +2057,87 @@ class Bot:
         rt.rebuild()
         self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил.")
 
+    def acquire_check(self, rt: UserRuntime, chat_id: int, wait: float = 20) -> bool:
+        """Ждём, пока закончится плановая проверка этого пользователя (если она идёт прямо сейчас)."""
+        if rt.lock.acquire(timeout=wait):
+            return True
+        self.tg.send(chat_id, "⏳ Сейчас идёт плановая проверка, сайт отвечает медленно. Попробуйте через минуту.")
+        return False
+
     def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
         if rt is None:
             return
         self.tg.send(chat_id, "🔎 Проверяю…")
-        if rt.lzt is None:
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            # Ручная проверка: один запрос без повторов и пауз, ошибку показываем сразу
+            if rt.lzt is None:
+                self.tg.send(chat_id, "lzt.market: нет токена. Добавить: /token lzt")
+            else:
+                rt.lzt.last_error = None
+                items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
+                if not items:
+                    err = rt.lzt.last_error
+                    rt.record_error(err)
+                    self.tg.send(chat_id, "lzt.market: по фильтру ничего не найдено"
+                                 + (f" или сайт не ответил: {html.escape(err)}" if err else "."))
+                else:
+                    latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
+                    self.tg.send(chat_id, f"lzt.market: лотов на первой странице {len(items)}. Последние:")
+                    for item in latest:
+                        self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
+            if rt.tron is not None:
+                rt.tron.last_error = None
+                items = rt.tron.fetch_items(retries=1)
+                if not items:
+                    err = rt.tron.last_error
+                    rt.record_error(err)
+                    self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр не подошёл ни один"
+                                 + (f". Сайт не ответил: {html.escape(err)}" if err else ". Поля лота: /trondump"))
+                else:
+                    self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр подходят {len(items)}. Последние:")
+                    for item in items[:3]:
+                        self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
+        finally:
+            rt.lock.release()
+
+    def cmd_lztdump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+        if not rt or rt.lzt is None:
             self.tg.send(chat_id, "lzt.market: нет токена. Добавить: /token lzt")
-        else:
-            items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]))
-            if not items:
-                self.tg.send(chat_id, "lzt.market: по фильтру ничего не найдено или сайт не ответил. Подробности в /status.")
-            else:
-                latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
-                self.tg.send(chat_id, f"lzt.market: лотов на первой странице {len(items)}. Последние:")
-                for item in latest:
-                    self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
-        if rt.tron is not None:
-            items = rt.tron.fetch_items()
-            if not items:
-                self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр не подошёл ни один "
-                                      "или сайт не ответил. Подробности в /status, поля лота: /trondump")
-            else:
-                self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр подходят {len(items)}. Последние:")
-                for item in items[:3]:
-                    self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
+            return
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
+        finally:
+            rt.lock.release()
+        if not items:
+            self.tg.send(chat_id, "lzt.market: лотов нет или сайт не ответил"
+                         + (f": {html.escape(rt.lzt.last_error)}" if rt.lzt.last_error else "."))
+            return
+        raw = {k: v for k, v in items[0].items() if not isinstance(v, (dict, list))}
+        self.tg.send(chat_id, "lzt.market: первый лот как отдаёт API:\n<pre>"
+                     + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
+
+    def cmd_trondump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+        if not rt or rt.tron is None:
+            self.tg.send(chat_id, "tronaccs выключен или нет токена. /tron on, /token tron")
+            return
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            raw, count = rt.tron.fetch_raw_sample()
+        except (TronError, requests.RequestException) as exc:
+            self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+            return
+        finally:
+            rt.lock.release()
+        if raw is None:
+            self.tg.send(chat_id, "tronaccs вернул пустой список.")
+            return
+        self.tg.send(chat_id, f"tronaccs: лотов на первой странице {count}. Первый как есть:\n<pre>"
+                     + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
 
     def cmd_status(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
         if rt is None:
@@ -2150,6 +2223,11 @@ def deliver_new(bot: Bot, rt: UserRuntime, items: list[dict], new_items: list[di
 
 
 def check_user(bot: Bot, rt: UserRuntime) -> None:
+    with rt.lock:
+        _check_user(bot, rt)
+
+
+def _check_user(bot: Bot, rt: UserRuntime) -> None:
     p, st = rt.profile, rt.stats
     if rt.lzt is not None:
         items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]))

@@ -263,8 +263,9 @@ class TronApiClient:
 
     def _request(self, method: str, path: str, **kw):
         timeout = kw.pop("timeout", (10, 45))  # (соединение, чтение): сервер бывает медленным
+        retries = max(1, kw.pop("retries", 5))
         last_exc: Exception | None = None
-        for attempt in range(1, 6):
+        for attempt in range(1, retries + 1):
             # Держим паузу между любыми запросами к tronaccs, из какого бы потока они ни шли
             with TronApiClient._pace_lock:
                 wait = TronApiClient._last_request_at + self.MIN_INTERVAL - time.time()
@@ -278,7 +279,7 @@ class TronApiClient:
                 finally:
                     TronApiClient._last_request_at = time.time()
             if resp is None:  # таймаут/обрыв: повторяем с паузой
-                if attempt < 5:
+                if attempt < retries:
                     log.warning("tronaccs: сеть недоступна (попытка %d): %s", attempt, last_exc)
                     time.sleep(min(2 ** attempt, 15))
                     continue
@@ -291,7 +292,7 @@ class TronApiClient:
                 raise TronError(f"tronaccs: HTTP {resp.status_code}, ответ не JSON: {resp.text[:200]}")
             message = str((data.get("message") if isinstance(data, dict) else "") or "")
             limited = resp.status_code == 429 or "Попробуйте через" in message or "Превышено количество" in message
-            if limited and attempt < 5:
+            if limited and attempt < retries:
                 m = re.search(r"через\s+(\d+)", message)
                 delay = int(m.group(1)) if m else 2
                 log.warning("tronaccs: лимит запросов, жду %d с (попытка %d)", delay, attempt)
@@ -330,17 +331,17 @@ class TronApiClient:
         data = self._request("GET", "/me")
         return data.get("user") or {} if isinstance(data, dict) else {}
 
-    def fetch_raw_page(self, page: int = 1, params: dict | None = None):
+    def fetch_raw_page(self, page: int = 1, params: dict | None = None, retries: int = 5):
         q = {"category": self.category, "page": page, "orderBy": "time_add", "orderType": "DESC"}
         q.update(params or {})
-        return self._request("GET", "/items", params=q)
+        return self._request("GET", "/items", params=q, retries=retries)
 
-    def fetch_items(self, params: dict | None = None) -> list[dict]:
-        """Лоты, новые первыми, с первых max_pages страниц."""
+    def fetch_items(self, params: dict | None = None, retries: int = 5) -> list[dict]:
+        """Лоты, новые первыми, с первых max_pages страниц. retries=1 — без ожидания при лимите запросов."""
         items: dict[int, dict] = {}
         page_size = None
         for page in range(1, self.max_pages + 1):
-            data = self.fetch_raw_page(page, params)
+            data = self.fetch_raw_page(page, params, retries=retries)
             if isinstance(data, dict) and str(data.get("status", "ok")).lower() not in ("ok", "true", "success", "1"):
                 raise TronError(f"tronaccs: {data.get('result') or data.get('message') or data}")
             raw_list = data.get("items") if isinstance(data, dict) else data

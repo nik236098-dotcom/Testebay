@@ -106,7 +106,6 @@ class Config:
         self.poll_interval = max(5, int(os.getenv("POLL_INTERVAL", "60")))
         self.notify_on_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "0") == "1"
         self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"  # 1 - спрашивать подтверждение перед покупкой
-        # Второй сайт: страница каталога tronaccs.market (пусто - выключено)
         # Второй сайт: tronaccs.market через API (токен в настройках аккаунта, раздел "API TronAccs")
         self.tron_token = os.getenv("TRON_TOKEN", "").strip()
         self.tron_enabled = os.getenv("TRON_ENABLED", "1" if self.tron_token else "0") == "1"
@@ -186,6 +185,7 @@ class State:
         self.subscribers: list[int] = []
         self.tg_offset = 0
         self.settings: dict = {}           # простые настройки из меню /settings
+        self.country_ids: dict = {}        # код страны -> ID на tronaccs (см. /tronid)
         self.category: str | None = None   # фильтр, заданный командой /filter
         self.query: str | None = None
         self.tron_enabled: bool | None = None  # /tron on|off; None - как в .env
@@ -203,6 +203,7 @@ class State:
             self.subscribers = [int(x) for x in data.get("subscribers", [])]
             self.tg_offset = int(data.get("tg_offset", 0))
             self.settings = data.get("settings") or {}
+            self.country_ids = {str(k).upper(): int(v) for k, v in (data.get("country_ids") or {}).items()}
             self.category = data.get("category") or None
             self.query = data.get("query")
             self.tron_enabled = data.get("tron_enabled")
@@ -223,6 +224,7 @@ class State:
                 "subscribers": self.subscribers,
                 "tg_offset": self.tg_offset,
                 "settings": self.settings,
+                "country_ids": self.country_ids,
                 "category": self.category,
                 "query": self.query,
                 "tron_enabled": self.tron_enabled,
@@ -417,16 +419,41 @@ class TronClient:
 
     name = "tron"
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, country_ids: dict | None = None) -> None:
         self.cfg = cfg
         self.api = TronApiClient(cfg.tron_token, cfg.tron_category, cfg.tron_pages)
-        self.set_filter(cfg.tron_filter)
+        self.country_ids = country_ids if country_ids is not None else {}
+        self.set_filter(cfg.tron_filter, self.country_ids)
         self.last_total = 0
 
-    def set_filter(self, text: str) -> None:
-        """Часть условий уходит серверу параметрами, остальное проверяем у себя."""
+    def set_filter(self, text: str, country_ids: dict | None = None) -> None:
+        """Часть условий уходит серверу параметрами, остальное проверяем у себя.
+
+        Если для кода страны известен её ID на tronaccs (см. find_country_id),
+        передаём его серверу параметром country, а код всё равно проверяем сами.
+        """
         self.rules = parse_filter(text)  # ValueError, если не разобрали
         self.params, self.local_rules = build_params(self.rules)
+        ids = country_ids or {}
+        codes = [v.upper() for k, op, v in self.local_rules if k in ("country", "страна") and op == "="]
+        known = [str(ids[c]) for c in codes if c in ids]
+        if known and "country" not in self.params:
+            self.params["country"] = ",".join(known)
+
+    def find_country_id(self, code: str, max_id: int = 300, progress=None) -> int | None:
+        """Перебирает country=1..max_id и ищет ID, при котором приходят только аккаунты с этим кодом."""
+        code = code.upper()
+        for cid in range(1, max_id + 1):
+            data = self.api.fetch_raw_page(1, {"country": str(cid)})
+            raw = data.get("items") if isinstance(data, dict) else None
+            if raw:
+                codes = {str(r.get("telegram_counrty") or r.get("telegram_country") or "").upper() for r in raw if isinstance(r, dict)}
+                if codes == {code}:
+                    return cid
+            if progress and cid % 50 == 0:
+                progress(cid)
+            time.sleep(0.25)
+        return None
 
     def fetch_items(self) -> list[dict]:
         try:
@@ -562,6 +589,7 @@ class Bot:
         "/check — проверить прямо сейчас и показать последние лоты по фильтру\n"
         "/tron on|off — следить ещё и за tronaccs.market (нужен TRON_TOKEN)\n"
         "/tronfilter country=UZ contacts>=100 — фильтр для tronaccs, /trondump — поля лота\n"
+        "/tronid UZ — узнать ID страны на tronaccs, чтобы фильтр по стране работал на их сервере\n"
         "/id — показать ваш Telegram ID"
     )
 
@@ -679,7 +707,7 @@ class Bot:
             text = " ".join(parts)
             self.cfg.tron_filter = text
             if self.tron is not None:
-                self.tron.set_filter(text)
+                self.tron.set_filter(text, self.state.country_ids)
             self.state.set_tron(filter_text=text)
             applied.append("tronaccs: " + (html.escape(text) or "без фильтра")
                            + ("" if self.tron else " (сейчас выключен, /tron on)"))
@@ -954,7 +982,7 @@ class Bot:
                     self.tg.send(chat_id, "⚠️ Нет TRON_TOKEN в .env. Токен создаётся в настройках аккаунта tronaccs, раздел «API TronAccs».")
                     return
                 self.cfg.tron_enabled = True
-                self.tron = TronClient(self.cfg)
+                self.tron = TronClient(self.cfg, self.state.country_ids)
                 self.state.set_tron(enabled=True)
                 log.info("tronaccs включён пользователем %s", user_id)
                 self.tg.send(chat_id, "✅ tronaccs включён. Текущие лоты запомню молча, дальше буду присылать новые.\n"
@@ -990,11 +1018,45 @@ class Bot:
                 return
             self.cfg.tron_filter = text
             if self.tron is not None:
-                self.tron.set_filter(text)
+                self.tron.set_filter(text, self.state.country_ids)
             self.state.set_tron(filter_text=text)
             log.info("tronaccs: фильтр изменён пользователем %s: %s", user_id, text or "нет")
             self.tg.send(chat_id, "✅ Фильтр tronaccs: " + (html.escape(text) or "снят")
                          + "\nТекущие подходящие лоты запомню молча, дальше буду присылать новые.")
+        elif command == "/tronid":
+            if self.tron is None:
+                self.tg.send(chat_id, "tronaccs выключен. Включить: /tron on")
+                return
+            code = arg.strip().upper()
+            if code == "RESET":
+                with self.state.lock:
+                    self.state.country_ids = {}
+                    self.state.save()
+                self.tg.send(chat_id, "Список ID стран очищен.")
+                return
+            if not re.fullmatch(r"[A-Z]{2}", code):
+                known = ", ".join(f"{k}={v}" for k, v in sorted(self.state.country_ids.items())) or "пока нет"
+                self.tg.send(chat_id, "Пришлите код страны: <code>/tronid UZ</code>\nИзвестные ID: " + html.escape(known))
+                return
+            if code in self.state.country_ids:
+                self.tg.send(chat_id, f"{code} = ID {self.state.country_ids[code]} (уже известен). Искать заново: сначала /tronid reset")
+                return
+            self.tg.send(chat_id, f"🔎 Ищу ID страны {code} перебором через API tronaccs, это займёт до пары минут…")
+            try:
+                cid = self.tron.find_country_id(code, progress=lambda n: self.tg.send(chat_id, f"…проверил {n} ID"))
+            except (TronError, requests.RequestException) as exc:
+                self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+                return
+            if cid is None:
+                self.tg.send(chat_id, f"Не нашёл ID для {code}: ни один ID от 1 до 300 не даёт только аккаунты {code}. "
+                                      "Возможно, сейчас нет лотов этой страны. Фильтр по коду страны продолжает работать на стороне бота.")
+                return
+            with self.state.lock:
+                self.state.country_ids[code] = cid
+                self.state.save()
+            self.tron.set_filter(self.cfg.tron_filter, self.state.country_ids)
+            log.info("tronaccs: страна %s = ID %d", code, cid)
+            self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил, теперь фильтр по стране уходит на сервер tronaccs.")
         elif command == "/trondump":
             if self.tron is None:
                 self.tg.send(chat_id, "tronaccs выключен. Включить: /tron on")
@@ -1273,7 +1335,7 @@ def main(argv: list[str]) -> int:
     tron = None
     if cfg.tron_enabled and cfg.tron_token:
         try:
-            tron = TronClient(cfg)
+            tron = TronClient(cfg, state.country_ids)
         except ValueError as exc:
             log.error("tronaccs: фильтр не разобран: %s", exc)
     elif cfg.tron_enabled:

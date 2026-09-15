@@ -184,11 +184,11 @@ class TokenTests(unittest.TestCase):
         bot.is_owner = Mock(return_value=False)
         for command in ('/start', '/help', '/unknown'):
             bot.handle({'message': {'chat': {'id': 10}, 'from': {'id': 1}, 'text': command}})
-            if command == '/start':
+            if command in ('/start', '/unknown'):
                 self.assertIn('Главное меню', bot.tg.send_screen.call_args.args[1])
             else:
                 self.assertTrue(bot.tg.edit_text.called)
-        self.assertEqual(bot.tg.send_screen.call_count, 1)
+        self.assertEqual(bot.tg.send_screen.call_count, 2)
 
     def test_command_exception_notifies_user(self):
         bot, _ = self.make_bot()

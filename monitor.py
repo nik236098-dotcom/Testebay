@@ -1337,9 +1337,9 @@ class Bot:
         return {"inline_keyboard": rows}
 
     def show_page(self, p: dict, chat_id: int, text: str, keyboard: dict,
-                  page: str, message_id: int | None = None) -> int | None:
+                  page: str, message_id: int | None = None, new_message: bool = False) -> int | None:
         messages = p.setdefault("menu_messages", {})
-        message_id = message_id or messages.get(str(chat_id))
+        message_id = None if new_message else (message_id or messages.get(str(chat_id)))
         self.active_pages[(p["user_id"], chat_id)] = (page, message_id)
         if message_id:
             if not self.tg.edit_text(chat_id, message_id, text, keyboard):
@@ -1355,7 +1355,7 @@ class Bot:
                 self.state.save()
         return message_id
 
-    def show_menu(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
+    def show_menu(self, p: dict, chat_id: int, message_id: int | None = None, new_message: bool = False) -> None:
         self.awaiting.pop(chat_id, None)
         name = p.get("name") or "друг"
         if name == "owner":
@@ -1368,7 +1368,7 @@ class Bot:
                 + "\n⚙️ <b>Настройки</b> — страна, контакты, спамблок и цена."
                 + "\n📊 <b>Статус</b> — текущие условия поиска и результаты."
                 + "\n🔎 <b>Проверить сейчас</b> — показать подходящие аккаунты.")
-        self.show_page(p, chat_id, text, self.menu_keyboard(), "home", message_id)
+        self.show_page(p, chat_id, text, self.menu_keyboard(), "home", message_id, new_message=new_message)
 
     def show_balances(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
         message_id = self.show_page(p, chat_id, "💳 <b>Балансы площадок</b>\n\nЗапрашиваю актуальные данные…",
@@ -1894,9 +1894,9 @@ class Bot:
                 if valid:
                     self.handle_awaiting(p, chat_id, kind, text, message_id)
                 else:
-                    self.show_menu(p, chat_id)
+                    self.show_menu(p, chat_id, new_message=True)
             elif p is not None:
-                self.show_menu(p, chat_id)
+                self.show_menu(p, chat_id, new_message=True)
             return
 
         parts = text.split(maxsplit=1)
@@ -1909,7 +1909,7 @@ class Bot:
             if command == "/start" and chat_id not in p["chats"]:
                 p["chats"].append(chat_id)
                 self.state.save()
-            self.show_menu(p, chat_id)
+            self.show_menu(p, chat_id, new_message=True)
             return
 
         if command == "/id":
@@ -1940,21 +1940,21 @@ class Bot:
         if command == "/settings":
             self.show_settings(p, chat_id)
         elif command == "/menu":
-            self.show_menu(p, chat_id)
+            self.show_menu(p, chat_id, new_message=True)
         elif command in ("/balance", "/balances"):
             self.show_balances(p, chat_id)
         elif command == "/start":
             if chat_id not in p["chats"]:
                 p["chats"].append(chat_id)
                 self.state.save()
-            self.show_menu(p, chat_id)
+            self.show_menu(p, chat_id, new_message=True)
         elif command == "/stop":
             if chat_id in p["chats"]:
                 p["chats"].remove(chat_id)
                 self.state.save()
-                self.show_menu(p, chat_id)
+                self.show_menu(p, chat_id, new_message=True)
             else:
-                self.show_menu(p, chat_id)
+                self.show_menu(p, chat_id, new_message=True)
         elif command == "/help":
             self.show_page(p, chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""),
                            self.back_keyboard(), "help")
@@ -2014,7 +2014,7 @@ class Bot:
             else:
                 self.tg.send(chat_id, "Такого пользователя нет.")
         else:
-            self.show_menu(p, chat_id)
+            self.show_menu(p, chat_id, new_message=True)
 
     def handle_awaiting(self, p: dict, chat_id: int, kind: str, text: str, message_id: int | None) -> None:
         if kind == "eva_token":

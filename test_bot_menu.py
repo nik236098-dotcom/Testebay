@@ -35,11 +35,11 @@ class MenuTests(unittest.TestCase):
     def message(self, text):
         self.bot.handle({"message": {"chat": {"id": 10}, "from": {"id": 1}, "text": text}})
 
-    def test_menu_commands_edit_same_message(self):
+    def test_text_opens_new_menu_and_screen_commands_edit(self):
         for cmd in ('/start', '/menu', '/settings', '/status', '/help', 'меню', '/unknown'):
             self.message(cmd)
-        self.assertEqual(self.tg.send_screen.call_count, 1)
-        self.assertEqual(self.tg.edit_text.call_count, 6)
+        self.assertEqual(self.tg.send_screen.call_count, 4)
+        self.assertEqual(self.tg.edit_text.call_count, 3)
         self.assertTrue(all(call.args[1] == 100 for call in self.tg.edit_text.call_args_list))
         self.tg.send.assert_not_called()
         self.assertEqual(self.p['menu_messages'], {'10': 100})

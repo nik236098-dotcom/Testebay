@@ -262,7 +262,8 @@ class TronApiClient:
     _pace_lock = threading.Lock()  # общий на все экземпляры: монитор и бот ходят в API из разных потоков
 
     def _request(self, method: str, path: str, **kw):
-        timeout = kw.pop("timeout", 30)
+        timeout = kw.pop("timeout", (10, 45))  # (соединение, чтение): сервер бывает медленным
+        last_exc: Exception | None = None
         for attempt in range(1, 6):
             # Держим паузу между любыми запросами к tronaccs, из какого бы потока они ни шли
             with TronApiClient._pace_lock:
@@ -271,8 +272,17 @@ class TronApiClient:
                     time.sleep(wait)
                 try:
                     resp = self.session.request(method, f"{TRON_API}{path}", timeout=timeout, **kw)
+                except (requests.Timeout, requests.ConnectionError) as exc:
+                    last_exc = exc
+                    resp = None
                 finally:
                     TronApiClient._last_request_at = time.time()
+            if resp is None:  # таймаут/обрыв: повторяем с паузой
+                if attempt < 5:
+                    log.warning("tronaccs: сеть недоступна (попытка %d): %s", attempt, last_exc)
+                    time.sleep(min(2 ** attempt, 15))
+                    continue
+                raise TronError(f"tronaccs: сеть недоступна: {last_exc}")
             if resp.status_code == 401:
                 raise TronError("tronaccs: 401, проверьте TRON_TOKEN")
             try:

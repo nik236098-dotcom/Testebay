@@ -115,11 +115,11 @@ def _parse_price(text: str) -> tuple[int | float | None, str | None]:
     return value, currency
 
 
-def _item_block(anchor: _Node) -> _Node:
+def _item_block(anchor: _Node, link_re: re.Pattern = ITEM_LINK_RE) -> _Node:
     """Поднимаемся от ссылки к блоку лота: до элемента, где встречается цена,
     но не дальше блока, в котором есть ссылки на другие лоты."""
     node = anchor
-    own_id = ITEM_LINK_RE.match(anchor.attrs.get("href", "")).group(1)
+    own_id = link_re.match(anchor.attrs.get("href", "")).group(1)
     for _ in range(8):
         parent = node.parent
         if parent is None or parent.tag == "root":
@@ -127,7 +127,7 @@ def _item_block(anchor: _Node) -> _Node:
         other_ids = {
             m.group(1)
             for a in _anchors_in(parent)
-            if (m := ITEM_LINK_RE.match(a.attrs.get("href", ""))) and m.group(1) != own_id
+            if (m := link_re.match(a.attrs.get("href", ""))) and m.group(1) != own_id
         }
         if other_ids:
             break
@@ -150,17 +150,21 @@ def _anchors_in(node: _Node) -> list[_Node]:
     return out
 
 
-def parse_items(html_text: str) -> list[dict]:
+def parse_items(html_text: str, link_re: re.Pattern = ITEM_LINK_RE, item_url: str | None = None) -> list[dict]:
+    """Ищет лоты по ссылкам, подходящим под link_re (первая группа - id лота).
+
+    item_url - шаблон адреса лота с {id}; если задан, попадает в item["url"].
+    """
     builder = _TreeBuilder()
     builder.feed(html_text)
 
     items: dict[int, dict] = {}
     for anchor in builder.anchors:
-        m = ITEM_LINK_RE.match(anchor.attrs.get("href", "") or "")
+        m = link_re.match(anchor.attrs.get("href", "") or "")
         if not m:
             continue
         item_id = int(m.group(1))
-        block = _item_block(anchor)
+        block = _item_block(anchor, link_re)
         block_text = block.all_text()
         price, currency = _parse_price(block_text)
         title = anchor.all_text().strip() or anchor.attrs.get("title", "").strip()
@@ -189,8 +193,24 @@ def parse_items(html_text: str) -> list[dict]:
         item["web_details"] = details[:300]
         if not item["title"]:
             item["title"] = f"Лот #{item['item_id']}"
+        if item_url:
+            item["url"] = item_url.format(id=item["item_id"])
         result.append(item)
     return result
+
+
+# ---------- другие сайты ----------
+
+# tronaccs.market: лоты по адресам вида https://tronaccs.market/telegram/877128
+TRON_URL = "https://tronaccs.market"
+def tron_link_re(category: str = "telegram") -> re.Pattern:
+    """Ссылки на лоты нужной категории: /telegram/877128. Прочие разделы (faq и т.п.) не трогаем."""
+    return re.compile(
+        r"^(?:https?://(?:www\.)?tronaccs\.market)?/" + re.escape(category) + r"/(\d{2,})/?(?:[?#].*)?$"
+    )
+
+
+TRON_LINK_RE = tron_link_re("telegram")
 
 
 # ---------- загрузка ----------
@@ -270,4 +290,24 @@ def fetch_items_web(
     items = parse_items(html_text)
     if not items:
         log.warning("На странице не найдено ни одного лота. Проверьте фильтры или включите USE_BROWSER=1.")
+    return items
+
+
+def fetch_page_items(
+    url: str,
+    link_re: re.Pattern,
+    item_url: str,
+    cookies: str | None = None,
+    use_browser: bool = False,
+    session: requests.Session | None = None,
+    user_data_dir: str = ".browser-profile",
+) -> list[dict]:
+    """Универсальная загрузка каталога другого сайта: адрес страницы + регулярка ссылок на лот."""
+    if use_browser:
+        html_text = fetch_html_browser(url, cookies, user_data_dir)
+    else:
+        html_text = fetch_html_requests(url, cookies, session)
+    items = parse_items(html_text, link_re, item_url)
+    if not items:
+        log.warning("На странице %s не найдено ни одного лота.", url)
     return items

@@ -364,8 +364,18 @@ class State:
                 "country_ids": self.country_ids,
                 "owner_id": self.owner_id,
             }
+            # Профили правятся из потоков проверки без этого замка; если словарь изменился
+            # прямо во время сериализации — просто пробуем ещё раз
+            for attempt in range(5):
+                try:
+                    payload = json.dumps(data, ensure_ascii=False)
+                    break
+                except RuntimeError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(payload, encoding="utf-8")
             tmp.replace(self.path)
 
     def get(self, user_id: int) -> dict | None:
@@ -2963,6 +2973,15 @@ def check_user(bot: Bot, rt: UserRuntime) -> None:
         _check_user(bot, rt)
 
 
+def check_user_safe(bot: Bot, rt: UserRuntime) -> None:
+    """Плановая проверка одного пользователя; ошибка одного не мешает остальным."""
+    try:
+        check_user(bot, rt)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Ошибка при проверке пользователя %s", rt.profile.get("user_id"))
+        rt.record_error(f"{type(exc).__name__}: {exc}")
+
+
 CHECK_SHOW_ITEMS = 3  # сколько последних лотов с каждой площадки присылать по /check
 DOWN_AFTER_FAILS = 2  # столько плановых проверок подряд с ошибкой = сайт «лёг»
 UP_AFTER_OKS = 2      # столько удачных проверок подряд после этого = сайт «встал» (один проскочивший запрос не считаем)
@@ -3188,15 +3207,18 @@ def main(argv: list[str]) -> int:
 
     once = "--once" in argv
     while True:
+        # Каждого пользователя проверяем в своём потоке: иначе, пока первому рассылаются лоты
+        # (по секунде на лот) или его сайт тормозит, остальные получают те же лоты с опозданием.
+        threads = []
         for uid in list(bot.runtimes):
             rt = bot.runtime(uid)
             if rt is None:
                 continue
-            try:
-                check_user(bot, rt)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Ошибка при проверке пользователя %s", uid)
-                rt.record_error(f"{type(exc).__name__}: {exc}")
+            t = threading.Thread(target=check_user_safe, args=(bot, rt), name=f"check-{uid}", daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
         if once:
             return 0
         time.sleep(cfg.poll_interval)

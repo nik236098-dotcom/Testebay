@@ -1,14 +1,21 @@
 """
-tronaccs.market через официальный API (https://tronaccs.readme.io).
+tronaccs.market через System API v2 (https://tronaccs-market.readme.io).
 
-    GET  https://system-api.tronaccs.market/items/telegram?page=N  - все аккаунты в продаже
-    GET  https://system-api.tronaccs.market/item/{id}
-    POST https://system-api.tronaccs.market/buy/{id}                - покупка
+    GET  https://system-api.tronaccs.market/items?category=telegram&page=1&orderBy=time_add&orderType=DESC
+         + фильтры: priceFrom/priceTo, contactsFrom/contactsTo, dialogsFrom/To, channelsFrom/To,
+           chatsFrom/To, premium (0/1), spamblock (0/1), two_fa (0/1), ageFrom/To, starsFrom/To,
+           country (числовые ID, справочника нет), origin (ID), searchString ...
+    POST https://system-api.tronaccs.market/items/{id}/purchase
     Authorization: Bearer <токен из настроек аккаунта, раздел "API TronAccs">
 
-У метода списка нет параметров фильтра, поэтому фильтруем на своей стороне
-(см. parse_filter / match_filter). Формат ответа в документации не описан,
-разбор сделан терпимым к названиям полей.
+Ответ списка: {"status": "ok", "items": [{item_id, item_url, published_date, title, price,
+price_currency, price_fees, telegram_counrty (код страны, опечатка в API),
+telegram_contacts_count, telegram_spam_block, telegram_premium, telegram_channels_count,
+telegram_conversations_count, telegram_password (2FA), ...}]}
+
+Фильтр пользователя (строка вида "country=UZ contacts>=100 spam=no price<=500")
+разбирается в parse_filter; то, что умеет сервер, уходит параметрами запроса
+(build_params), остальное проверяется на своей стороне (match_filter).
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -24,52 +32,123 @@ log = logging.getLogger("lzt-monitor.tron")
 TRON_API = "https://system-api.tronaccs.market"
 TRON_SITE = "https://tronaccs.market"
 
-ID_KEYS = ("item_id", "id", "account_id")
-TITLE_KEYS = ("title", "name", "username")
-PRICE_KEYS = ("price", "cost", "amount")
-# Поля, которые не показываем и по которым не фильтруем (длинные/служебные/секретные)
-HIDDEN_KEYS = {
-    "auth_key", "authkey", "session", "tdata", "telethon", "pyrogram", "json", "password",
-    "description", "user", "seller", "images", "image", "photo",
-}
-
 
 class TronError(RuntimeError):
     pass
 
 
-# ---------- фильтр на своей стороне ----------
+# ---------- разбор фильтра ----------
 
-_OPS = ("!=", ">=", "<=", "=", ">", "<", "~")
 _TOKEN_RE = re.compile(r'(\S+?)(!=|>=|<=|=|>|<|~)("[^"]*"|\S+)')
-
 TRUE_WORDS = {"yes", "true", "1", "да", "есть", "on"}
 FALSE_WORDS = {"no", "false", "0", "нет", "off", "none", "null", ""}
+
+# Синонимы ключей фильтра -> (параметр API "от", параметр API "до") для числовых диапазонов
+RANGE_KEYS = {
+    "price": ("priceFrom", "priceTo"), "цена": ("priceFrom", "priceTo"),
+    "contacts": ("contactsFrom", "contactsTo"), "контакты": ("contactsFrom", "contactsTo"),
+    "dialogs": ("dialogsFrom", "dialogsTo"), "conversations": ("dialogsFrom", "dialogsTo"), "диалоги": ("dialogsFrom", "dialogsTo"),
+    "channels": ("channelsFrom", "channelsTo"), "каналы": ("channelsFrom", "channelsTo"),
+    "chats": ("chatsFrom", "chatsTo"), "чаты": ("chatsFrom", "chatsTo"),
+    "age": ("ageFrom", "ageTo"), "возраст": ("ageFrom", "ageTo"),
+    "stars": ("starsFrom", "starsTo"),
+    "idlength": ("idLengthFrom", "idLengthTo"), "id_length": ("idLengthFrom", "idLengthTo"),
+    "admin_channels": ("adminChannelsFrom", "adminChannelsTo"),
+    "admin_chats": ("adminChatsFrom", "adminChatsTo"),
+    "gifts": ("giftsRegularFrom", "giftsRegularTo"), "nft": ("giftsNftFrom", "giftsNftTo"),
+    "settle": ("settle", None), "days": ("settle", None),
+}
+# Булевы ключи -> параметр API
+BOOL_KEYS = {
+    "spam": "spamblock", "spamblock": "spamblock", "спам": "spamblock", "спамблок": "spamblock",
+    "premium": "premium", "премиум": "premium",
+    "2fa": "two_fa", "two_fa": "two_fa", "password": "two_fa", "пароль": "two_fa",
+    "geo": "spamblock_geo", "spamblock_geo": "spamblock_geo",
+    "admin": "with_admin_channels",
+}
+# Ключи, которые сервер принимает как ID (число); иначе проверяем сами по коду в лоте
+ID_KEYS = {"country": "country", "страна": "country", "origin": "origin", "происхождение": "origin"}
 
 
 def parse_filter(text: str) -> list[tuple[str, str, str]]:
     """'country=UZ contacts>=100 spam=no price<=500' -> [(key, op, value), ...]."""
     rules = []
     for m in _TOKEN_RE.finditer(text or ""):
-        key, op, value = m.group(1), m.group(2), m.group(3).strip('"')
-        rules.append((key.strip().lower(), op, value))
+        rules.append((m.group(1).strip().lower(), m.group(2), m.group(3).strip('"')))
     if (text or "").strip() and not rules:
         raise ValueError("Не понял фильтр. Пример: country=UZ contacts>=100 spam=no price<=500")
     return rules
 
 
+def _bool_value(value: str) -> int | None:
+    v = value.strip().lower()
+    if v in TRUE_WORDS:
+        return 1
+    if v in FALSE_WORDS:
+        return 0
+    return None
+
+
+def build_params(rules: list[tuple[str, str, str]]) -> tuple[dict, list[tuple[str, str, str]]]:
+    """Разделяем правила: что умеет сервер -> параметры запроса, остальное -> проверка у себя."""
+    params: dict = {}
+    local: list[tuple[str, str, str]] = []
+    for key, op, value in rules:
+        if key in RANGE_KEYS and op in (">", ">=", "<", "<=", "="):
+            lo, hi = RANGE_KEYS[key]
+            num = value.replace(",", ".")
+            try:
+                float(num)
+            except ValueError:
+                local.append((key, op, value))
+                continue
+            if op in (">", ">=", "=") and lo:
+                params[lo] = num
+            if op in ("<", "<=", "=") and hi:
+                params[hi] = num
+            if op in (">", "<"):  # сервер знает только "от/до" включительно, уточним у себя
+                local.append((key, op, value))
+        elif key in BOOL_KEYS and op in ("=", "!="):
+            b = _bool_value(value)
+            if b is None:
+                local.append((key, op, value))
+                continue
+            if op == "!=":
+                b = 1 - b
+            params[BOOL_KEYS[key]] = b
+        elif key in ID_KEYS and op == "=" and re.fullmatch(r"[\d,]+", value):
+            params[ID_KEYS[key]] = value
+        else:
+            local.append((key, op, value))
+    return params, local
+
+
+# ---------- проверка на своей стороне ----------
+
+# Поле лота для ключа фильтра (после normalize)
+FIELD_ALIASES = {
+    "country": "telegram_country", "страна": "telegram_country",
+    "contacts": "telegram_contacts_count", "контакты": "telegram_contacts_count",
+    "dialogs": "telegram_conversations_count", "conversations": "telegram_conversations_count", "диалоги": "telegram_conversations_count",
+    "channels": "telegram_channels_count", "каналы": "telegram_channels_count",
+    "spam": "telegram_spam_block", "spamblock": "telegram_spam_block", "спам": "telegram_spam_block", "спамблок": "telegram_spam_block",
+    "premium": "telegram_premium", "премиум": "telegram_premium",
+    "2fa": "telegram_password", "two_fa": "telegram_password", "password": "telegram_password",
+    "price": "price", "цена": "price",
+    "title": "title", "название": "title", "name": "title",
+    "seller": "seller_username", "продавец": "seller_username",
+    "origin": "item_origin", "stars": "telegram_raiting_stars", "level": "telegram_raiting_level",
+}
+
+
 def _find_key(item: dict, key: str):
-    """Точное совпадение ключа, иначе ключ, содержащий искомое слово."""
+    if key in FIELD_ALIASES and FIELD_ALIASES[key] in item:
+        return FIELD_ALIASES[key]
     keys = {k.lower(): k for k in item}
     if key in keys:
         return keys[key]
-    candidates = [k for kl, k in keys.items() if key in kl and kl not in HIDDEN_KEYS]
-    if len(candidates) == 1:
-        return candidates[0]
-    if candidates:
-        # предпочитаем самый короткий ключ: "contacts" вместо "contacts_last_seen"
-        return sorted(candidates, key=len)[0]
-    return None
+    candidates = [k for kl, k in keys.items() if key in kl]
+    return sorted(candidates, key=len)[0] if candidates else None
 
 
 def _to_number(value):
@@ -78,9 +157,8 @@ def _to_number(value):
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
-        s = value.strip().replace(" ", "").replace(",", ".")
         try:
-            return float(s)
+            return float(value.strip().replace(" ", "").replace(",", "."))
         except ValueError:
             return None
     return None
@@ -89,30 +167,23 @@ def _to_number(value):
 def _match_rule(item: dict, key: str, op: str, expected: str) -> bool:
     real_key = _find_key(item, key)
     if real_key is None:
-        return False  # поля нет - лот не подходит под условие
+        return False
     actual = item[real_key]
-
     if op == "~":
         return expected.lower() in str(actual).lower()
 
+    e_bool = _bool_value(expected)
     a_num, e_num = _to_number(actual), _to_number(expected)
-    if op in (">", "<", ">=", "<=") or (a_num is not None and e_num is not None and op in ("=", "!=")):
+    if op in (">", "<", ">=", "<="):
         if a_num is None or e_num is None:
             return False
-        return {
-            ">": a_num > e_num, "<": a_num < e_num, ">=": a_num >= e_num,
-            "<=": a_num <= e_num, "=": a_num == e_num, "!=": a_num != e_num,
-        }[op]
-
-    # строки и булевы: да/нет, yes/no, true/false
-    e = expected.strip().lower()
-    if isinstance(actual, bool) or e in TRUE_WORDS or e in FALSE_WORDS:
-        a_bool = actual if isinstance(actual, bool) else (
-            str(actual).strip().lower() in TRUE_WORDS if str(actual).strip().lower() in TRUE_WORDS | FALSE_WORDS else bool(actual)
-        )
-        e_bool = e in TRUE_WORDS
+        return {">": a_num > e_num, "<": a_num < e_num, ">=": a_num >= e_num, "<=": a_num <= e_num}[op]
+    if e_bool is not None and (isinstance(actual, bool) or a_num in (0.0, 1.0) or str(actual).lower() in TRUE_WORDS | FALSE_WORDS):
+        a_bool = 1 if (actual is True or a_num == 1.0 or str(actual).lower() in TRUE_WORDS) else 0
         return (a_bool == e_bool) if op == "=" else (a_bool != e_bool)
-    equal = str(actual).strip().lower() == e
+    if a_num is not None and e_num is not None:
+        return (a_num == e_num) if op == "=" else (a_num != e_num)
+    equal = str(actual).strip().lower() == expected.strip().lower()
     return equal if op == "=" else not equal
 
 
@@ -122,73 +193,60 @@ def match_filter(item: dict, rules: list[tuple[str, str, str]]) -> bool:
 
 # ---------- клиент ----------
 
-def _first(d: dict, keys) :
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return None
-
-
-def extract_list(data) -> list[dict]:
-    """Находим список лотов в ответе неизвестной формы."""
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if not isinstance(data, dict):
-        return []
-    for key in ("items", "data", "accounts", "result", "results", "list", "products"):
-        value = data.get(key)
-        if isinstance(value, list):
-            return [x for x in value if isinstance(x, dict)]
-        if isinstance(value, dict):
-            inner = extract_list(value)
-            if inner:
-                return inner
-    return []
-
-
-def normalize(raw: dict, category: str = "telegram") -> dict | None:
-    item_id = _first(raw, ID_KEYS)
+def _to_ts(value) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().replace("Z", "+00:00")
     try:
-        item_id = int(item_id)
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def normalize(raw: dict) -> dict | None:
+    """Приводим лот tronaccs к виду лота lzt, чтобы форматирование и кнопки были общими."""
+    try:
+        item_id = int(raw.get("item_id") or raw.get("id"))
     except (TypeError, ValueError):
         return None
-    price = _first(raw, PRICE_KEYS)
-    price_num = _to_number(price)
-    if price_num is not None and price_num.is_integer():
-        price = int(price_num)
-    elif price_num is not None:
-        price = price_num
-    currency = _first(raw, ("currency", "price_currency")) or "rub"
-
-    details = []
-    for key, value in raw.items():
-        kl = key.lower()
-        if kl in HIDDEN_KEYS or kl in ID_KEYS or kl in TITLE_KEYS or kl in PRICE_KEYS:
-            continue
-        if isinstance(value, (dict, list)) or value in (None, ""):
-            continue
-        s = str(value)
-        if len(s) > 60:
-            continue
-        details.append(f"{key}: {s}")
-
+    price = raw.get("price_fees") if raw.get("price_fees") not in (None, "") else raw.get("price")
+    p = _to_number(price)
+    if p is not None:
+        price = int(p) if p.is_integer() else p
     item = {
         "item_id": item_id,
-        "title": str(_first(raw, TITLE_KEYS) or f"Лот #{item_id}"),
+        "title": str(raw.get("title") or f"Лот #{item_id}"),
         "price": price,
-        "price_currency": str(currency).lower(),
-        "web_details": "; ".join(details)[:400],
-        "url": f"{TRON_SITE}/{category}/{item_id}",
+        "price_currency": str(raw.get("price_currency") or "rub").lower(),
+        "published_date": _to_ts(raw.get("published_date")),
+        "url": raw.get("item_url") or f"{TRON_SITE}/{raw.get('category') or 'telegram'}/{item_id}",
         "source": "tron",
+        "item_origin": raw.get("item_origin"),
+        "seller_username": raw.get("seller_username"),
         "raw": raw,
     }
+    # telegram_* поля переносим как есть; опечатку API telegram_counrty исправляем
+    for key, value in raw.items():
+        if key.startswith("telegram_") and value not in (None, ""):
+            item["telegram_country" if key == "telegram_counrty" else key] = value
+    base = _to_number(raw.get("price"))
+    if base is not None and raw.get("price_fees") not in (None, "") and base != _to_number(raw.get("price_fees")):
+        item["web_details"] = f"без комиссии {int(base) if base.is_integer() else base}"
     return item
 
 
 class TronApiClient:
     name = "tron"
 
-    def __init__(self, token: str, category: str = "telegram", max_pages: int = 5) -> None:
+    def __init__(self, token: str, category: str = "telegram", max_pages: int = 2) -> None:
         self.category = category
         self.max_pages = max(1, max_pages)
         self.session = requests.Session()
@@ -197,64 +255,61 @@ class TronApiClient:
             "Accept": "application/json",
             "User-Agent": "lzt-market-monitor/1.0",
         })
-        self.last_error: str | None = None
-        self.page_size: int | None = None
 
-    def _get(self, path: str, params: dict | None = None):
-        resp = self.session.get(f"{TRON_API}{path}", params=params, timeout=30)
+    def _request(self, method: str, path: str, **kw):
+        resp = self.session.request(method, f"{TRON_API}{path}", timeout=kw.pop("timeout", 30), **kw)
         if resp.status_code == 401:
             raise TronError("tronaccs: 401, проверьте TRON_TOKEN")
         if resp.status_code == 429:
             raise TronError("tronaccs: превышен лимит запросов (429)")
-        if resp.status_code >= 400:
-            raise TronError(f"tronaccs: HTTP {resp.status_code}: {resp.text[:200]}")
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
-            raise TronError(f"tronaccs: ответ не JSON: {resp.text[:200]}")
+            raise TronError(f"tronaccs: HTTP {resp.status_code}, ответ не JSON: {resp.text[:200]}")
+        if resp.status_code >= 400:
+            raise TronError(f"tronaccs: HTTP {resp.status_code}: {str(data)[:200]}")
+        return data
 
-    def fetch_raw_page(self, page: int = 1):
-        return self._get(f"/items/{self.category}", {"page": page})
+    def me(self) -> dict:
+        """GET /me: баланс и валюта."""
+        data = self._request("GET", "/me")
+        return data.get("user") or {} if isinstance(data, dict) else {}
 
-    def fetch_items(self) -> list[dict]:
-        """Все доступные лоты с первых max_pages страниц."""
+    def fetch_raw_page(self, page: int = 1, params: dict | None = None):
+        q = {"category": self.category, "page": page, "orderBy": "time_add", "orderType": "DESC"}
+        q.update(params or {})
+        return self._request("GET", "/items", params=q)
+
+    def fetch_items(self, params: dict | None = None) -> list[dict]:
+        """Лоты, новые первыми, с первых max_pages страниц."""
         items: dict[int, dict] = {}
+        page_size = None
         for page in range(1, self.max_pages + 1):
-            data = self.fetch_raw_page(page)
-            raw_list = extract_list(data)
-            if not raw_list:
+            data = self.fetch_raw_page(page, params)
+            if isinstance(data, dict) and str(data.get("status", "ok")).lower() not in ("ok", "true", "success", "1"):
+                raise TronError(f"tronaccs: {data.get('result') or data.get('message') or data}")
+            raw_list = data.get("items") if isinstance(data, dict) else data
+            if not isinstance(raw_list, list) or not raw_list:
                 break
             for raw in raw_list:
-                item = normalize(raw, self.category)
-                if item:
-                    items[item["item_id"]] = item
-            if self.page_size is None:
-                self.page_size = len(raw_list)
-            if len(raw_list) < (self.page_size or 1):
-                break  # последняя страница
-            if isinstance(data, dict):
-                total_pages = _to_number(_first(data, ("total_pages", "pages", "last_page", "pageCount")))
-                if total_pages is not None and page >= total_pages:
-                    break
+                if isinstance(raw, dict):
+                    item = normalize(raw)
+                    if item:
+                        items[item["item_id"]] = item
+            page_size = page_size or len(raw_list)
+            if len(raw_list) < page_size:
+                break
             time.sleep(0.3)
         return list(items.values())
 
     def buy(self, item_id: int) -> tuple[bool, str]:
         try:
-            resp = self.session.post(f"{TRON_API}/buy/{item_id}", timeout=90)
+            data = self._request("POST", f"/items/{item_id}/purchase", timeout=90)
+        except TronError as exc:
+            return False, str(exc)
         except requests.RequestException as exc:
             return False, f"Ошибка сети: {exc}"
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {}
-        if resp.status_code >= 400:
-            msg = ""
-            if isinstance(data, dict):
-                msg = str(data.get("message") or data.get("error") or data.get("errors") or "")
-            return False, f"HTTP {resp.status_code}: {msg or resp.text[:200]}"
-        if isinstance(data, dict):
-            status = str(data.get("status") or "").lower()
-            if status and status not in ("ok", "success", "true", "1"):
-                return False, str(data.get("message") or data.get("error") or data)[:300]
-        return True, "Покупка прошла. Данные аккаунта в личном кабинете tronaccs (Мои покупки)."
+        status = data.get("status") if isinstance(data, dict) else None
+        text = str((data.get("result") if isinstance(data, dict) else None) or data)[:300]
+        ok = status is True or str(status).lower() in ("ok", "true", "success", "1")
+        return ok, text if ok else (text or "Маркет отказал в покупке")

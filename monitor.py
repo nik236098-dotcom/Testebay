@@ -40,7 +40,7 @@ from urllib.parse import parse_qsl, urlencode
 import requests
 from urllib.parse import urlparse
 
-from tron_source import TronApiClient, TronError, match_filter, parse_filter
+from tron_source import TronApiClient, TronError, build_params, match_filter, parse_filter
 from web_source import WebSourceError, fetch_items_web
 
 try:  # .env необязателен, но удобен для локального запуска
@@ -110,7 +110,7 @@ class Config:
         self.tron_token = os.getenv("TRON_TOKEN", "").strip()
         self.tron_enabled = os.getenv("TRON_ENABLED", "1" if self.tron_token else "0") == "1"
         self.tron_filter = os.getenv("TRON_FILTER", "").strip()
-        self.tron_pages = max(1, int(os.getenv("TRON_PAGES", "5")))
+        self.tron_pages = max(1, int(os.getenv("TRON_PAGES", "2")))
         self.tron_category = os.getenv("TRON_CATEGORY", "telegram").strip() or "telegram"
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
@@ -416,31 +416,42 @@ class TronClient:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.api = TronApiClient(cfg.tron_token, cfg.tron_category, cfg.tron_pages)
-        self.rules = parse_filter(cfg.tron_filter)
+        self.set_filter(cfg.tron_filter)
         self.last_total = 0
 
     def set_filter(self, text: str) -> None:
+        """Часть условий уходит серверу параметрами, остальное проверяем у себя."""
         self.rules = parse_filter(text)  # ValueError, если не разобрали
+        self.params, self.local_rules = build_params(self.rules)
 
     def fetch_items(self) -> list[dict]:
         try:
-            items = self.api.fetch_items()
+            items = self.api.fetch_items(self.params)
         except (TronError, requests.RequestException) as exc:
             log.error("%s", exc)
             _record_error(str(exc))
             return []
         self.last_total = len(items)
         STATS["tron_total"] = len(items)
-        if self.rules:
-            items = [i for i in items if match_filter(i.get("raw") or i, self.rules)]
+        if self.local_rules:
+            items = [i for i in items if match_filter(i, self.local_rules)]
         return items
 
     def fetch_raw_sample(self) -> tuple[dict | None, int]:
-        """Первый лот как есть + сколько всего на странице: чтобы увидеть названия полей."""
-        data = self.api.fetch_raw_page(1)
-        from tron_source import extract_list
-        raw = extract_list(data)
+        """Первый лот как есть + сколько на странице: чтобы увидеть названия полей."""
+        data = self.api.fetch_raw_page(1, self.params)
+        raw = data.get("items") if isinstance(data, dict) else data
+        raw = raw if isinstance(raw, list) else []
         return (raw[0] if raw else (data if isinstance(data, dict) else None)), len(raw)
+
+    def balance(self) -> str | None:
+        try:
+            user = self.api.me()
+        except (TronError, requests.RequestException) as exc:
+            return f"ошибка: {exc}"
+        if not user:
+            return None
+        return f"{user.get('balance')} {str(user.get('currency') or '').upper()}".strip()
 
     def buy(self, item_id: int) -> tuple[bool, str]:
         return self.api.buy(item_id)
@@ -723,10 +734,10 @@ class Bot:
             if self.tron is not None:
                 items = self.tron.fetch_items()
                 if not items:
-                    self.tg.send(chat_id, f"tronaccs: всего лотов {self.tron.last_total}, под фильтр не подошёл ни один "
+                    self.tg.send(chat_id, f"tronaccs: получено лотов {self.tron.last_total}, под фильтр не подошёл ни один "
                                           "или сайт не ответил. Подробности в /status, поля лота: /trondump")
                 else:
-                    self.tg.send(chat_id, f"tronaccs: всего лотов {self.tron.last_total}, под фильтр подходят {len(items)}. Первые:")
+                    self.tg.send(chat_id, f"tronaccs: получено лотов {self.tron.last_total}, под фильтр подходят {len(items)}. Последние:")
                     for item in items[:3]:
                         self.tg.send(chat_id, format_item(item), self.item_keyboard(item))
         elif command == "/tron":
@@ -759,7 +770,9 @@ class Bot:
             if not arg:
                 self.tg.send(chat_id, "Фильтр tronaccs: " + (html.escape(self.cfg.tron_filter) or "нет")
                              + "\n\nЗадать: <code>/tronfilter country=UZ contacts>=100 spam=no price<=500</code>\n"
-                               "Условия: = != > < >= <= и ~ (содержит). Названия полей смотрите в /trondump.\n"
+                               "Поля: price (с комиссией), contacts, dialogs, channels, chats, age (лет), stars, "
+                               "spam, premium, 2fa, country (код, напр. UZ), seller, title~слово.\n"
+                               "Условия: = != > < >= <= и ~ (содержит). Сырые поля лота: /trondump.\n"
                                "Снять фильтр: /tronfilter off")
                 return
             text = "" if arg.lower() in ("off", "нет", "снять") else arg
@@ -770,7 +783,7 @@ class Bot:
                 return
             self.cfg.tron_filter = text
             if self.tron is not None:
-                self.tron.rules = rules
+                self.tron.set_filter(text)
             self.state.set_tron(filter_text=text)
             log.info("tronaccs: фильтр изменён пользователем %s: %s", user_id, text or "нет")
             self.tg.send(chat_id, "✅ Фильтр tronaccs: " + (html.escape(text) or "снят")
@@ -810,7 +823,11 @@ class Bot:
             if last_items is not None:
                 lines.append(f"Лотов по фильтру: {last_items}, новых в последней проверке: {STATS['last_new']}")
             if STATS.get("tron_items") is not None:
-                lines.append(f"tronaccs: всего {STATS.get('tron_total', 0)}, под фильтр {STATS['tron_items']}, новых {STATS['tron_new']}")
+                lines.append(f"tronaccs: получено {STATS.get('tron_total', 0)}, под фильтр {STATS['tron_items']}, новых {STATS['tron_new']}")
+            if self.tron is not None:
+                bal = self.tron.balance()
+                if bal:
+                    lines.append(f"Баланс tronaccs: {html.escape(bal)}")
             if meta:
                 lines.append("Ответ API: " + html.escape(", ".join(f"{k}={v}" for k, v in meta.items())))
             if STATS["last_error"]:
@@ -980,8 +997,8 @@ def deliver_new(items: list[dict], new_items: list[dict], name: str, cfg: Config
             log.info("%s: первый запуск, запомнил %d текущих лотов, уведомлять буду о новых", name, len(items))
             return 0
 
-    if name == "lzt":  # самые старые сначала, чтобы сообщения шли в хронологическом порядке
-        new_items.sort(key=lambda i: int(i.get("published_date") or 0))
+    # Самые старые сначала, чтобы сообщения шли в хронологическом порядке
+    new_items.sort(key=lambda i: int(i.get("published_date") or 0))
 
     with state.lock:
         subscribers = list(state.subscribers)

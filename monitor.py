@@ -103,6 +103,7 @@ class Config:
         self.query = os.getenv("LZT_QUERY", DEFAULT_QUERY).strip().lstrip("?")
         self.poll_interval = max(5, int(os.getenv("POLL_INTERVAL", "60")))
         self.notify_on_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "0") == "1"
+        self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"  # 1 - спрашивать подтверждение перед покупкой
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -509,13 +510,13 @@ class Bot:
             self.tg.answer_callback(cq_id, "Покупка доступна только в режиме SOURCE=api", alert=True)
             return
 
-        if action == "buy":
+        if action == "buy" and self.cfg.buy_confirm:
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "confirm"))
             self.tg.answer_callback(cq_id, "Подтвердите покупку")
         elif action == "cancel":
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "buy"))
             self.tg.answer_callback(cq_id, "Отменено")
-        elif action == "confirm":
+        elif action in ("buy", "confirm"):
             self.tg.answer_callback(cq_id, "Покупаю…")
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "done"))
             ok, text = self.lzt.fast_buy(item_id, price)

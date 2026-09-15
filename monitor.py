@@ -597,7 +597,8 @@ class Bot:
         "/filter — показать текущий фильтр\n"
         "/check — проверить прямо сейчас и показать последние лоты по фильтру\n"
         "/tron on|off — следить ещё и за tronaccs.market (нужен TRON_TOKEN)\n"
-        "/tronfilter country=UZ contacts>=100 — фильтр для tronaccs, /trondump — поля лота\n"
+        "/tronfilter country=UZ contacts>=100 — фильтр для tronaccs\n"
+        "/lztdump, /trondump — показать лот в сыром виде, как отдаёт сайт\n"
         "/tronid UZ — узнать ID страны на tronaccs, чтобы фильтр по стране работал на их сервере\n"
         "/id — показать ваш Telegram ID"
     )
@@ -1079,6 +1080,14 @@ class Bot:
             self.tron.set_filter(self.cfg.tron_filter, self.state.country_ids)
             log.info("tronaccs: страна %s = ID %d", code, cid)
             self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил, теперь фильтр по стране уходит на сервер tronaccs.")
+        elif command == "/lztdump":
+            items = self.lzt.fetch_items(self.cfg.category, self.cfg.api_params()) if self.lzt else []
+            if not items:
+                self.tg.send(chat_id, "lzt.market: лотов нет или сайт не ответил. Подробности в /status.")
+                return
+            raw = {k: v for k, v in items[0].items() if not isinstance(v, (dict, list))}
+            text = json.dumps(raw, ensure_ascii=False, indent=1)
+            self.tg.send(chat_id, f"lzt.market: первый лот как отдаёт API:\n<pre>{html.escape(text[:3500])}</pre>")
         elif command == "/trondump":
             if self.tron is None:
                 self.tg.send(chat_id, "tronaccs выключен. Включить: /tron on")
@@ -1218,14 +1227,31 @@ def _yes_no(value) -> str:
 
 
 def _spam(value) -> str:
-    """lzt: 0 нет, 1 есть, -1 не проверялся; tronaccs: true/false."""
-    if value in (True, 1, "1", "yes", "true"):
-        return "есть ⛔"
-    if value in (False, 0, "0", "no", "false"):
-        return "нет ✅"
-    if value in (-1, "-1"):
-        return "не проверялся ❔"
-    return "неизвестно ❔"
+    """lzt: -1 нет спамблока, 1 есть, 0 не проверялся, большое число - дата окончания;
+    tronaccs: true/false."""
+    if isinstance(value, bool):
+        return "есть ⛔" if value else "нет ✅"
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("yes", "true"):
+            return "есть ⛔"
+        if s in ("no", "false"):
+            return "нет ✅"
+        try:
+            value = int(s)
+        except ValueError:
+            return f"{html.escape(value)} ❔"
+    if isinstance(value, (int, float)):
+        n = int(value)
+        if n == 1:
+            return "есть ⛔"
+        if n == -1:
+            return "нет ✅"
+        if n == 0:
+            return "не проверялся ❔"
+        if n > 10**8:  # похоже на дату окончания спамблока
+            return f"до {_fmt_date(n)} ⛔"
+    return f"{html.escape(str(value))} ❔"
 
 
 def _fmt_value(value, kind: str) -> str | None:

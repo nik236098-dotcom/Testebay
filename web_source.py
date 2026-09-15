@@ -199,18 +199,6 @@ def parse_items(html_text: str, link_re: re.Pattern = ITEM_LINK_RE, item_url: st
     return result
 
 
-# ---------- другие сайты ----------
-
-# tronaccs.market: лоты по адресам вида https://tronaccs.market/telegram/877128
-TRON_URL = "https://tronaccs.market"
-def tron_link_re(category: str = "telegram") -> re.Pattern:
-    """Ссылки на лоты нужной категории: /telegram/877128. Прочие разделы (faq и т.п.) не трогаем."""
-    return re.compile(
-        r"^(?:https?://(?:www\.)?tronaccs\.market)?/" + re.escape(category) + r"/(\d{2,})/?(?:[?#].*)?$"
-    )
-
-
-TRON_LINK_RE = tron_link_re("telegram")
 
 
 # ---------- загрузка ----------

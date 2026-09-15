@@ -40,7 +40,8 @@ from urllib.parse import parse_qsl, urlencode
 import requests
 from urllib.parse import urlparse
 
-from web_source import TRON_URL, WebSourceError, fetch_items_web, fetch_page_items, tron_link_re
+from tron_source import TronApiClient, TronError, match_filter, parse_filter
+from web_source import WebSourceError, fetch_items_web
 
 try:  # .env необязателен, но удобен для локального запуска
     from dotenv import load_dotenv
@@ -105,8 +106,12 @@ class Config:
         self.notify_on_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "0") == "1"
         self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"  # 1 - спрашивать подтверждение перед покупкой
         # Второй сайт: страница каталога tronaccs.market (пусто - выключено)
-        self.tron_url = os.getenv("TRON_URL", "").strip() or None
-        self.cookies_tron = os.getenv("TRON_COOKIES", "").strip() or None
+        # Второй сайт: tronaccs.market через API (токен в настройках аккаунта, раздел "API TronAccs")
+        self.tron_token = os.getenv("TRON_TOKEN", "").strip()
+        self.tron_enabled = os.getenv("TRON_ENABLED", "1" if self.tron_token else "0") == "1"
+        self.tron_filter = os.getenv("TRON_FILTER", "").strip()
+        self.tron_pages = max(1, int(os.getenv("TRON_PAGES", "5")))
+        self.tron_category = os.getenv("TRON_CATEGORY", "telegram").strip() or "telegram"
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -147,8 +152,10 @@ class Config:
         if state.category and state.query is not None:
             self.category = state.category
             self.query = state.query
-        if state.tron_url is not None:  # "" означает выключено командой /tron off
-            self.tron_url = state.tron_url or None
+        if state.tron_enabled is not None:  # задано командой /tron on|off
+            self.tron_enabled = state.tron_enabled
+        if state.tron_filter is not None:   # задано командой /tronfilter
+            self.tron_filter = state.tron_filter
 
 
 def parse_market_url(url: str) -> tuple[str, str]:
@@ -179,7 +186,8 @@ class State:
         self.tg_offset = 0
         self.category: str | None = None   # фильтр, заданный командой /filter
         self.query: str | None = None
-        self.tron_url: str | None = None   # адрес каталога tronaccs, заданный /tron
+        self.tron_enabled: bool | None = None  # /tron on|off; None - как в .env
+        self.tron_filter: str | None = None    # /tronfilter; None - как в .env
         self.extra: dict[str, dict] = {}   # просмотренные лоты других сайтов: {"tron": {"seen": [], "initialized": bool}}
         self._load()
 
@@ -194,7 +202,8 @@ class State:
             self.tg_offset = int(data.get("tg_offset", 0))
             self.category = data.get("category") or None
             self.query = data.get("query")
-            self.tron_url = data.get("tron_url")
+            self.tron_enabled = data.get("tron_enabled")
+            self.tron_filter = data.get("tron_filter")
             self.extra = {
                 name: {"seen": [int(x) for x in v.get("seen", [])], "initialized": bool(v.get("initialized"))}
                 for name, v in (data.get("extra") or {}).items()
@@ -212,7 +221,8 @@ class State:
                 "tg_offset": self.tg_offset,
                 "category": self.category,
                 "query": self.query,
-                "tron_url": self.tron_url,
+                "tron_enabled": self.tron_enabled,
+                "tron_filter": self.tron_filter,
                 "extra": self.extra,
             }
             for v in self.extra.values():
@@ -246,10 +256,13 @@ class State:
         else:
             self._bucket(name)["initialized"] = value
 
-    def set_tron_url(self, url: str) -> None:
-        """"" выключает второй сайт. Лоты по нему забываем, первая проверка пройдёт молча."""
+    def set_tron(self, enabled: bool | None = None, filter_text: str | None = None) -> None:
+        """Изменение настроек tronaccs. Лоты по нему забываем, первая проверка пройдёт молча."""
         with self.lock:
-            self.tron_url = url
+            if enabled is not None:
+                self.tron_enabled = enabled
+            if filter_text is not None:
+                self.tron_filter = filter_text
             self.extra["tron"] = {"seen": [], "initialized": False}
             self.save()
 
@@ -396,33 +409,41 @@ class WebClient:
 
 
 class TronClient:
-    """tronaccs.market: разбор HTML-страницы каталога, API у сайта нет."""
+    """tronaccs.market через API system-api.tronaccs.market + фильтр на своей стороне."""
 
     name = "tron"
 
-    def __init__(self, url: str, cookies: str | None = None, use_browser: bool = False) -> None:
-        self.url = url
-        self.cookies = cookies
-        self.use_browser = use_browser
-        self.session = requests.Session()
-        # Категория из ссылки (?category=telegram) нужна для адреса лота
-        cat = dict(parse_qsl(urlparse(url).query)).get("category") or "telegram"
-        self.item_url = f"{TRON_URL}/{cat}/{{id}}"
-        self.link_re = tron_link_re(cat)
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.api = TronApiClient(cfg.tron_token, cfg.tron_category, cfg.tron_pages)
+        self.rules = parse_filter(cfg.tron_filter)
+        self.last_total = 0
+
+    def set_filter(self, text: str) -> None:
+        self.rules = parse_filter(text)  # ValueError, если не разобрали
 
     def fetch_items(self) -> list[dict]:
         try:
-            items = fetch_page_items(
-                self.url, self.link_re, self.item_url, self.cookies, self.use_browser,
-                self.session, user_data_dir=".browser-profile-tron",
-            )
-        except (WebSourceError, requests.RequestException) as exc:
-            log.error("tronaccs: не удалось загрузить страницу: %s", exc)
-            _record_error(f"tronaccs: {exc}")
+            items = self.api.fetch_items()
+        except (TronError, requests.RequestException) as exc:
+            log.error("%s", exc)
+            _record_error(str(exc))
             return []
-        for item in items:
-            item["source"] = self.name
+        self.last_total = len(items)
+        STATS["tron_total"] = len(items)
+        if self.rules:
+            items = [i for i in items if match_filter(i.get("raw") or i, self.rules)]
         return items
+
+    def fetch_raw_sample(self) -> tuple[dict | None, int]:
+        """Первый лот как есть + сколько всего на странице: чтобы увидеть названия полей."""
+        data = self.api.fetch_raw_page(1)
+        from tron_source import extract_list
+        raw = extract_list(data)
+        return (raw[0] if raw else (data if isinstance(data, dict) else None)), len(raw)
+
+    def buy(self, item_id: int) -> tuple[bool, str]:
+        return self.api.buy(item_id)
 
 
 class Telegram:
@@ -516,8 +537,8 @@ class Bot:
         "/filter <ссылка> — сменить фильтр: пришлите адрес страницы lzt.market с нужными фильтрами\n"
         "/filter — показать текущий фильтр\n"
         "/check — проверить прямо сейчас и показать последние лоты по фильтру\n"
-        "/tron <ссылка> — следить ещё и за tronaccs.market (адрес страницы каталога)\n"
-        "/tron off — выключить tronaccs, /tron — показать текущий адрес\n"
+        "/tron on|off — следить ещё и за tronaccs.market (нужен TRON_TOKEN)\n"
+        "/tronfilter country=UZ contacts>=100 — фильтр для tronaccs, /trondump — поля лота\n"
         "/id — показать ваш Telegram ID"
     )
 
@@ -543,15 +564,22 @@ class Bot:
         item_id = int(item["item_id"])
         price = item.get("price")
         rows = []
-        can_buy = self.cfg.source == "api" and price is not None and item.get("source", "lzt") == "lzt"
+        is_tron = item.get("source") == "tron"
+        if is_tron:
+            can_buy = self.tron is not None
+            p = "t"  # tbuy / tconfirm / tcancel
+        else:
+            can_buy = self.cfg.source == "api" and price is not None
+            p = ""
+        price_s = price if price is not None else 0
         if can_buy and stage == "buy":
             rows.append([{"text": f"🛒 Купить за {self._price_label(price, item.get('price_currency'))}",
-                          "callback_data": f"buy:{item_id}:{price}"}])
+                          "callback_data": f"{p}buy:{item_id}:{price_s}"}])
         elif can_buy and stage == "confirm":
             rows.append([
                 {"text": f"✅ Подтвердить за {self._price_label(price, item.get('price_currency'))}",
-                 "callback_data": f"confirm:{item_id}:{price}"},
-                {"text": "❌ Отмена", "callback_data": f"cancel:{item_id}:{price}"},
+                 "callback_data": f"{p}confirm:{item_id}:{price_s}"},
+                {"text": "❌ Отмена", "callback_data": f"{p}cancel:{item_id}:{price_s}"},
             ])
         rows.append([{"text": "🔗 Открыть на сайте", "url": item.get("url") or f"{MARKET_URL}/{item_id}/"}])
         return {"inline_keyboard": rows}
@@ -575,12 +603,23 @@ class Bot:
         except ValueError:
             self.tg.answer_callback(cq_id)
             return
+        is_tron = action.startswith("t")
+        if is_tron:
+            action = action[1:]
         item = {"item_id": item_id, "price": price}
+        if is_tron:
+            item["source"] = "tron"
+            item["url"] = f"https://tronaccs.market/{self.cfg.tron_category}/{item_id}"
+        item_url = item.get("url") or f"{MARKET_URL}/{item_id}/"
 
         if not self.allowed(user_id):
             self.tg.answer_callback(cq_id, "⛔ Доступ только владельцу", alert=True)
             return
-        if self.cfg.source != "api" or not hasattr(self.lzt, "fast_buy"):
+        if is_tron:
+            if self.tron is None:
+                self.tg.answer_callback(cq_id, "tronaccs выключен или нет TRON_TOKEN", alert=True)
+                return
+        elif self.cfg.source != "api" or not hasattr(self.lzt, "fast_buy"):
             self.tg.answer_callback(cq_id, "Покупка доступна только в режиме SOURCE=api", alert=True)
             return
 
@@ -593,13 +632,17 @@ class Bot:
         elif action in ("buy", "confirm"):
             self.tg.answer_callback(cq_id, "Покупаю…")
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "done"))
-            ok, text = self.lzt.fast_buy(item_id, price)
-            log.info("Покупка лота %d за %s пользователем %s: %s — %s", item_id, price, user_id, ok, text)
-            if ok:
-                self.tg.send(chat_id, f"✅ Куплен лот {item_id} за {self._price_label(price, None)}.\n"
-                                      f"{html.escape(text)}\n{MARKET_URL}/{item_id}/")
+            if is_tron:
+                ok, text = self.tron.buy(item_id)
             else:
-                self.tg.send(chat_id, f"❌ Не удалось купить лот {item_id}: {html.escape(text)}\n{MARKET_URL}/{item_id}/",
+                ok, text = self.lzt.fast_buy(item_id, price)
+            site = "tronaccs" if is_tron else "lzt"
+            log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, user_id, ok, text)
+            if ok:
+                self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
+                                      f"{html.escape(text)}\n{item_url}")
+            else:
+                self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(text)}\n{item_url}",
                              self.item_keyboard(item, "buy"))
         else:
             self.tg.answer_callback(cq_id)
@@ -680,36 +723,73 @@ class Bot:
             if self.tron is not None:
                 items = self.tron.fetch_items()
                 if not items:
-                    self.tg.send(chat_id, "tronaccs: лоты на странице не найдены или сайт не ответил. Подробности в /status.")
+                    self.tg.send(chat_id, f"tronaccs: всего лотов {self.tron.last_total}, под фильтр не подошёл ни один "
+                                          "или сайт не ответил. Подробности в /status, поля лота: /trondump")
                 else:
-                    self.tg.send(chat_id, f"tronaccs: лотов на странице {len(items)}. Первые:")
+                    self.tg.send(chat_id, f"tronaccs: всего лотов {self.tron.last_total}, под фильтр подходят {len(items)}. Первые:")
                     for item in items[:3]:
                         self.tg.send(chat_id, format_item(item), self.item_keyboard(item))
         elif command == "/tron":
-            if not arg:
-                url = self.cfg.tron_url
-                head = ("tronaccs: слежу за\n" + html.escape(url)) if url else "tronaccs выключен."
+            a = arg.lower()
+            if a in ("on", "вкл", "включить"):
+                if not self.cfg.tron_token:
+                    self.tg.send(chat_id, "⚠️ Нет TRON_TOKEN в .env. Токен создаётся в настройках аккаунта tronaccs, раздел «API TronAccs».")
+                    return
+                self.cfg.tron_enabled = True
+                self.tron = TronClient(self.cfg)
+                self.state.set_tron(enabled=True)
+                log.info("tronaccs включён пользователем %s", user_id)
+                self.tg.send(chat_id, "✅ tronaccs включён. Текущие лоты запомню молча, дальше буду присылать новые.\n"
+                                      "Фильтр: " + (html.escape(self.cfg.tron_filter) or "нет") + "\nПроверить: /check")
+            elif a in ("off", "выкл", "стоп"):
+                self.cfg.tron_enabled = False
+                self.tron = None
+                self.state.set_tron(enabled=False)
+                self.tg.send(chat_id, "🔕 tronaccs выключен.")
+            else:
                 self.tg.send(
                     chat_id,
-                    head + "\n\nВключить: <code>/tron https://tronaccs.market/?category=telegram</code>\nВыключить: /tron off",
+                    ("tronaccs: включён ✅" if self.tron else "tronaccs: выключен")
+                    + "\nФильтр: " + (html.escape(self.cfg.tron_filter) or "нет")
+                    + "\n\n/tron on — включить, /tron off — выключить\n"
+                      "/tronfilter country=UZ contacts>=100 spam=no price<=500 — фильтр\n"
+                      "/trondump — показать поля лота как их отдаёт сайт",
                 )
+        elif command == "/tronfilter":
+            if not arg:
+                self.tg.send(chat_id, "Фильтр tronaccs: " + (html.escape(self.cfg.tron_filter) or "нет")
+                             + "\n\nЗадать: <code>/tronfilter country=UZ contacts>=100 spam=no price<=500</code>\n"
+                               "Условия: = != > < >= <= и ~ (содержит). Названия полей смотрите в /trondump.\n"
+                               "Снять фильтр: /tronfilter off")
                 return
-            if arg.lower() in ("off", "выкл", "стоп"):
-                self.cfg.tron_url = None
-                self.tron = None
-                self.state.set_tron_url("")
-                self.tg.send(chat_id, "🔕 tronaccs выключен.")
+            text = "" if arg.lower() in ("off", "нет", "снять") else arg
+            try:
+                rules = parse_filter(text)
+            except ValueError as exc:
+                self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
                 return
-            url = arg if "://" in arg else "https://" + arg
-            if "tronaccs.market" not in urlparse(url).netloc.lower():
-                self.tg.send(chat_id, "⚠️ Нужна ссылка на tronaccs.market, например https://tronaccs.market/?category=telegram")
+            self.cfg.tron_filter = text
+            if self.tron is not None:
+                self.tron.rules = rules
+            self.state.set_tron(filter_text=text)
+            log.info("tronaccs: фильтр изменён пользователем %s: %s", user_id, text or "нет")
+            self.tg.send(chat_id, "✅ Фильтр tronaccs: " + (html.escape(text) or "снят")
+                         + "\nТекущие подходящие лоты запомню молча, дальше буду присылать новые.")
+        elif command == "/trondump":
+            if self.tron is None:
+                self.tg.send(chat_id, "tronaccs выключен. Включить: /tron on")
                 return
-            self.cfg.tron_url = url
-            self.tron = TronClient(url, self.cfg.cookies_tron, self.cfg.use_browser)
-            self.state.set_tron_url(url)
-            log.info("tronaccs включён пользователем %s: %s", user_id, url)
-            self.tg.send(chat_id, "✅ tronaccs включён:\n" + html.escape(url)
-                         + "\n\nТекущие лоты запомню молча, дальше буду присылать новые. Проверить: /check")
+            try:
+                raw, count = self.tron.fetch_raw_sample()
+            except (TronError, requests.RequestException) as exc:
+                self.tg.send(chat_id, "⚠️ " + html.escape(str(exc)))
+                return
+            if raw is None:
+                self.tg.send(chat_id, "tronaccs вернул пустой список.")
+                return
+            text = json.dumps(raw, ensure_ascii=False, indent=1)
+            self.tg.send(chat_id, f"tronaccs: лотов на первой странице {count}. Первый как есть:\n<pre>"
+                                  + html.escape(text[:3500]) + "</pre>")
         elif command == "/status":
             with self.state.lock:
                 subs = len(self.state.subscribers)
@@ -720,7 +800,7 @@ class Bot:
             lines = [
                 f"Фильтр: {html.escape(self.cfg.site_url())}",
                 f"Источник: {self.cfg.source}, интервал: {self.cfg.poll_interval} с",
-                "tronaccs: " + (html.escape(self.cfg.tron_url) if self.cfg.tron_url else "выключен"),
+                "tronaccs: " + (("включён, фильтр: " + (html.escape(self.cfg.tron_filter) or "нет")) if self.tron else "выключен"),
                 f"Подписчиков: {subs}, запомнено лотов: {seen}",
                 f"Этот чат {'подписан ✅' if subscribed else 'не подписан'}",
                 "",
@@ -730,7 +810,7 @@ class Bot:
             if last_items is not None:
                 lines.append(f"Лотов по фильтру: {last_items}, новых в последней проверке: {STATS['last_new']}")
             if STATS.get("tron_items") is not None:
-                lines.append(f"tronaccs: лотов {STATS['tron_items']}, новых {STATS['tron_new']}")
+                lines.append(f"tronaccs: всего {STATS.get('tron_total', 0)}, под фильтр {STATS['tron_items']}, новых {STATS['tron_new']}")
             if meta:
                 lines.append("Ответ API: " + html.escape(", ".join(f"{k}={v}" for k, v in meta.items())))
             if STATS["last_error"]:
@@ -880,13 +960,12 @@ def check_tron(cfg: Config, state: State, tron: "TronClient", tg: Telegram, bot:
     STATS["tron_items"] = len(items)
     STATS["tron_new"] = 0
     if not items:
-        log.warning("tronaccs: лотов нет (ошибка или пустая страница)")
+        log.warning("tronaccs: подходящих лотов нет (всего %d, ошибка или ничего под фильтр)", tron.last_total)
         return 0
     new_items = [i for i in items if not state.is_seen(int(i["item_id"]), "tron")]
     STATS["tron_new"] = len(new_items)
-    log.info("tronaccs: лотов %d, новых %d", len(items), len(new_items))
-    # На странице новые сверху, шлём в обратном порядке, чтобы самый свежий был последним
-    return deliver_new(items, list(reversed(new_items)), "tron", cfg, state, tg, bot)
+    log.info("tronaccs: всего %d, под фильтр %d, новых %d", tron.last_total, len(items), len(new_items))
+    return deliver_new(items, new_items, "tron", cfg, state, tg, bot)
 
 
 def deliver_new(items: list[dict], new_items: list[dict], name: str, cfg: Config, state: State,
@@ -967,7 +1046,14 @@ def main(argv: list[str]) -> int:
         return 0
 
     # Бот принимает /start и /stop в отдельном потоке, монитор крутится в основном
-    tron = TronClient(cfg.tron_url, cfg.cookies_tron, cfg.use_browser) if cfg.tron_url else None
+    tron = None
+    if cfg.tron_enabled and cfg.tron_token:
+        try:
+            tron = TronClient(cfg)
+        except ValueError as exc:
+            log.error("tronaccs: фильтр не разобран: %s", exc)
+    elif cfg.tron_enabled:
+        log.warning("tronaccs включён, но TRON_TOKEN пуст: второй сайт не мониторится")
     bot = Bot(cfg, state, tg, lzt, tron)
     threading.Thread(target=bot.run_forever, name="telegram-bot", daemon=True).start()
 

@@ -207,6 +207,51 @@ AUTOBUY_DEFAULT_SETTINGS = {
     "tron": False,
 }
 
+AUTOBUY_SITES = ("lzt", "tron")
+AUTOBUY_SITE_LABELS = {"lzt": "lzt.market", "tron": "tronaccs"}
+
+
+def new_autobuy() -> dict:
+    return {
+        "enabled": False,
+        "sources": ["lzt"],                    # площадки автопокупки, можно обе
+        "settings": dict(AUTOBUY_DEFAULT_SETTINGS),
+        "seen": {"lzt": [], "tron": []},       # ID лотов по площадкам (у lzt и tronaccs ID могут совпадать)
+        "attempts": {},                        # "lzt:123" -> ts последней попытки (анти-retry)
+        "init": {"lzt": False, "tron": False}, # тихая первая проверка по каждой площадке
+    }
+
+
+def autobuy_upgrade(ab: dict) -> dict:
+    """Старый формат (одна площадка в "source", общий список seen) -> новый, по площадкам."""
+    old_source = ab.pop("source", None) or "lzt"
+    if not isinstance(ab.get("sources"), list):
+        ab["sources"] = [old_source]
+    ab["sources"] = [x for x in ab["sources"] if x in AUTOBUY_SITES]
+    if not isinstance(ab.get("seen"), dict):
+        ab["seen"] = {old_source: list(ab.get("seen") or [])}
+    for site in AUTOBUY_SITES:
+        ab["seen"].setdefault(site, [])
+    if not isinstance(ab.get("init"), dict):
+        ab["init"] = {old_source: bool(ab.get("init"))}
+    for site in AUTOBUY_SITES:
+        ab["init"].setdefault(site, False)
+    ab.setdefault("enabled", False)
+    ab.setdefault("attempts", {})
+    return ab
+
+
+def autobuy_reset(ab: dict, attempts: bool = True) -> None:
+    """Условия изменились: забываем историю, следующая проверка каждой площадки — тихая."""
+    ab["seen"] = {site: [] for site in AUTOBUY_SITES}
+    ab["init"] = {site: False for site in AUTOBUY_SITES}
+    if attempts:
+        ab["attempts"] = {}
+
+
+def autobuy_sources_label(ab: dict) -> str:
+    return " + ".join(AUTOBUY_SITE_LABELS[x] for x in ab.get("sources") or []) or "не выбрана"
+
 
 # ---------- профили и состояние ----------
 
@@ -227,14 +272,7 @@ def new_profile(user_id: int, name: str, chat_id: int | None, cfg: Config, with_
         "seen": {"lzt": [], "tron": []},
         "init": {"lzt": False, "tron": False},
         # >>> AutoBuy <<<
-        "autobuy": {
-            "enabled": False,
-            "source": "lzt",          # "lzt" | "tron"
-            "settings": dict(AUTOBUY_DEFAULT_SETTINGS),
-            "seen": [],
-            "attempts": {},           # item_id -> ts последней попытки (анти-retry)
-            "init": False,
-        },
+        "autobuy": new_autobuy(),
         # Автозагрузка купленной .session во внешнюю панель (evangelion и т.п.)
         "upload_url": cfg.panel_url if with_env_tokens else "",
         "upload_token": cfg.panel_token if with_env_tokens else "",
@@ -277,16 +315,9 @@ class State:
         self.users = {str(k): v for k, v in (data.get("users") or {}).items()}
         if "subscribers" in data and not self.users:
             self._migrate_legacy(data)
-        # Свежие профили из старого state без autobuy: достраиваем поля
+        # Профили из старого state: достраиваем блок autobuy и переводим его на формат с несколькими площадками
         for p in self.users.values():
-            p.setdefault("autobuy", {
-                "enabled": False,
-                "source": "lzt",
-                "settings": dict(AUTOBUY_DEFAULT_SETTINGS),
-                "seen": [],
-                "attempts": {},
-                "init": False,
-            })
+            p["autobuy"] = autobuy_upgrade(p.get("autobuy") or new_autobuy())
 
     def _migrate_legacy(self, data: dict) -> None:
         """Старый однопользовательский state.json -> профиль владельца."""
@@ -319,7 +350,9 @@ class State:
                     p["seen"][k] = p["seen"][k][-MAX_SEEN_IDS:]
                 ab = p.get("autobuy") or {}
                 if ab:
-                    ab["seen"] = (ab.get("seen") or [])[-MAX_SEEN_IDS:]
+                    autobuy_upgrade(ab)
+                    for site in AUTOBUY_SITES:
+                        ab["seen"][site] = ab["seen"][site][-MAX_SEEN_IDS:]
                     attempts = ab.get("attempts") or {}
                     if len(attempts) > MAX_SEEN_IDS:
                         keep = sorted(attempts.items(), key=lambda kv: kv[1], reverse=True)[:MAX_SEEN_IDS]
@@ -1281,11 +1314,11 @@ class UserRuntime:
         self.tron_ab = None
         ab = p.get("autobuy") or {}
         if ab.get("enabled"):
-            source = ab.get("source") or "lzt"
+            sources = autobuy_upgrade(ab)["sources"]
             s = ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)
-            if source == "lzt" and p.get("lzt_token") and p.get("source") != "web":
+            if "lzt" in sources and p.get("lzt_token") and p.get("source") != "web":
                 self.lzt_ab = LztClient(p["lzt_token"])
-            elif source == "tron" and p.get("tron_token"):
+            if "tron" in sources and p.get("tron_token"):
                 try:
                     self.tron_ab = TronClient(
                         p["tron_token"], autobuy_tron_filter(s), self.state.country_ids,
@@ -1719,12 +1752,7 @@ class Bot:
     # --- меню /autobuy ---
 
     def autobuy_state(self, p: dict) -> dict:
-        ab = p.setdefault("autobuy", {})
-        ab.setdefault("enabled", False)
-        ab.setdefault("source", "lzt")
-        ab.setdefault("seen", [])
-        ab.setdefault("attempts", {})
-        ab.setdefault("init", False)
+        ab = autobuy_upgrade(p.setdefault("autobuy", {}))
         if not ab.get("settings"):
             reg = self.current_settings(p)
             ab["settings"] = {
@@ -1748,24 +1776,23 @@ class Bot:
         status = "включён 🟢" if ab["enabled"] else "выключен 🔴"
         lines = [f"🤖 <b>AutoBuy</b> — {status}"]
         if view == "main":
-            src = "lzt.market" if ab["source"] == "lzt" else "tronaccs"
-            lines.append(f"🏪 Площадка: <b>{src}</b>")
+            lines.append(f"🏪 Площадки: <b>{autobuy_sources_label(ab)}</b>")
             lines.append(html.escape(self._label(s)))
             lines.append("")
             lines.append("Бот сам купит новый лот, подходящий под условия.")
             lines.append("⚠️ Покупки реальные — не ставьте слишком широкий фильтр.")
             if ab["enabled"]:
-                if ab["source"] == "lzt" and not p.get("lzt_token"):
-                    lines.append("⚠️ Токен lzt.market не задан — AutoBuy работать не будет (/token lzt).")
-                if ab["source"] == "tron" and not p.get("tron_token"):
-                    lines.append("⚠️ Токен tronaccs не задан — AutoBuy работать не будет (/token tron).")
+                if "lzt" in ab["sources"] and not p.get("lzt_token"):
+                    lines.append("⚠️ Токен lzt.market не задан — на этой площадке AutoBuy работать не будет (/token lzt).")
+                if "tron" in ab["sources"] and not p.get("tron_token"):
+                    lines.append("⚠️ Токен tronaccs не задан — на этой площадке AutoBuy работать не будет (/token tron).")
                 if s.get("price_max") is None:
                     lines.append("⚠️ Лимит цены не задан — можно купить дорогой лот. Задайте «Цена» сверху.")
         hints = {"country": "\n\nКод страны двумя буквами.",
                  "contacts": "\n\nМинимальное число контактов.",
                  "spam": "\n\nСпамблок на аккаунте.",
                  "price": "\n\nМаксимальная цена — это ваш лимит на автопокупку.",
-                 "source": "\n\nС какой площадки покупать."}
+                 "source": "\n\nС каких площадок покупать. Можно отметить обе."}
         lines.append(hints.get(view, ""))
         return "\n".join(lines)
 
@@ -1774,9 +1801,9 @@ class Bot:
         s = ab["settings"]
         if view == "source":
             return {"inline_keyboard": [
-                [{"text": ("✅ " if ab["source"] == "lzt" else "") + "lzt.market",
+                [{"text": ("✅ " if "lzt" in ab["sources"] else "☐ ") + "lzt.market",
                   "callback_data": "ab:source:lzt"}],
-                [{"text": ("✅ " if ab["source"] == "tron" else "") + "tronaccs",
+                [{"text": ("✅ " if "tron" in ab["sources"] else "☐ ") + "tronaccs",
                   "callback_data": "ab:source:tron"}],
                 [{"text": "← Назад", "callback_data": "ab:menu:0"}],
             ]}
@@ -1821,10 +1848,9 @@ class Bot:
         # main
         toggle = "🔴 Выключить AutoBuy" if ab["enabled"] else "🟢 Включить AutoBuy"
         spam = {"no": "нет", "yes": "есть", "any": "любой"}.get(s.get("spam"), "любой")
-        src = "lzt.market" if ab["source"] == "lzt" else "tronaccs"
         return {"inline_keyboard": [
             [{"text": toggle, "callback_data": "ab:toggle:0"}],
-            [{"text": f"🏪 Площадка: {src}", "callback_data": "ab:view:source"}],
+            [{"text": f"🏪 Площадки: {autobuy_sources_label(ab)}", "callback_data": "ab:view:source"}],
             [{"text": f"🌍 Страна: {country_name(s['country'])}", "callback_data": "ab:view:country"}],
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "ab:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "ab:view:spam"}],
@@ -1848,9 +1874,7 @@ class Bot:
                            self.autobuy_keyboard(p, "price"), "autobuy", message_id)
             return
         # При смене условий забываем историю, первая проверка — тихая
-        ab["seen"] = []
-        ab["attempts"] = {}
-        ab["init"] = False
+        autobuy_reset(ab)
         self.state.save()
         rt = self.runtime(p["user_id"])
         if rt:
@@ -1883,15 +1907,18 @@ class Bot:
         elif kind == "toggle":
             # При попытке включить — предупреждаем, если нет токена нужной площадки
             if not ab["enabled"]:
-                if ab["source"] == "lzt" and not p.get("lzt_token"):
+                if not ab["sources"]:
+                    self.tg.answer_callback(cq_id, "Выберите хотя бы одну площадку", alert=True)
+                    return
+                if "lzt" in ab["sources"] and not p.get("lzt_token"):
                     self.tg.answer_callback(cq_id, "Нет токена lzt.market (/token lzt)", alert=True)
                     return
-                if ab["source"] == "tron" and not p.get("tron_token"):
+                if "tron" in ab["sources"] and not p.get("tron_token"):
                     self.tg.answer_callback(cq_id, "Нет токена tronaccs (/token tron)", alert=True)
                     return
             ab["enabled"] = not ab["enabled"]
             if ab["enabled"]:
-                ab["init"] = False  # первая проверка после включения — тихая
+                ab["init"] = {site: False for site in AUTOBUY_SITES}  # первая проверка после включения — тихая
             self.state.save()
             rt = self.runtime(user_id)
             if rt:
@@ -1904,15 +1931,19 @@ class Bot:
             if ab["enabled"]:
                 self.tg.answer_callback(cq_id, "Сначала выключите AutoBuy", alert=True)
                 return
-            ab["source"] = value
-            ab["seen"] = []
-            ab["attempts"] = {}
-            ab["init"] = False
+            if value not in AUTOBUY_SITES:
+                self.tg.answer_callback(cq_id)
+                return
+            if value in ab["sources"]:
+                ab["sources"].remove(value)
+            else:
+                ab["sources"].append(value)
+            autobuy_reset(ab)
             self.state.save()
             rt = self.runtime(user_id)
             if rt:
                 rt.rebuild()
-            self.show_autobuy(p, chat_id, message_id, "main")
+            self.show_autobuy(p, chat_id, message_id, "source")
         elif kind == "country":
             if value == "ask":
                 self.awaiting[chat_id] = (user_id, "ab_country")
@@ -1923,8 +1954,7 @@ class Bot:
                                "autobuy", message_id)
                 return
             s["country"] = "any" if value.lower() == "any" else value.upper()
-            ab["seen"] = []
-            ab["init"] = False
+            autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")
         elif kind == "contacts":
@@ -1936,14 +1966,12 @@ class Bot:
                                "autobuy", message_id)
                 return
             s["contacts"] = int(value)
-            ab["seen"] = []
-            ab["init"] = False
+            autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")
         elif kind == "spam":
             s["spam"] = value
-            ab["seen"] = []
-            ab["init"] = False
+            autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")
         elif kind in ("price_min", "price_max"):
@@ -1956,15 +1984,13 @@ class Bot:
                                "autobuy", message_id)
                 return
             s[kind] = int(value)
-            ab["seen"] = []
-            ab["init"] = False
+            autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "price")
         elif kind == "price_clear":
             s["price_min"] = None
             s["price_max"] = None
-            ab["seen"] = []
-            ab["init"] = False
+            autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")
         elif kind == "apply":
@@ -2415,9 +2441,7 @@ class Bot:
                     self.tg.send(chat_id, "Нужно число в рублях. 0 — без ограничения.")
                     return
                 s[sub] = int(digits) or None
-            ab["seen"] = []
-            ab["attempts"] = {}
-            ab["init"] = False
+            autobuy_reset(ab)
             self.awaiting.pop(chat_id, None)
             self.state.save()
             rt = self.runtime(p["user_id"])
@@ -2858,9 +2882,8 @@ class Bot:
         # >>> AutoBuy <<<
         ab = p.get("autobuy") or {}
         ab_on = bool(ab.get("enabled"))
-        src = "lzt.market" if ab.get("source") == "lzt" else "tronaccs"
         lines.append("\n🤖 <b>AutoBuy</b>: " + ("включён 🟢" if ab_on else "выключен 🔴")
-                     + (f" — {src}" if ab_on else ""))
+                     + (f" — {autobuy_sources_label(ab)}" if ab_on else ""))
         if ab_on:
             ab_s = ab.get("settings") or {}
             try:
@@ -3013,22 +3036,30 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
 
 
 def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
-    """Автопокупка новых лотов по отдельным условиям профиля (блок autobuy).
-
-    Первая проверка после включения/смены фильтра — тихая: запоминаем уже существующие
-    лоты, чтобы не скупить старое. Дальше — покупаем по мере появления.
-    """
-    p, state = rt.profile, bot.state
+    """Автопокупка новых лотов по отдельным условиям профиля (блок autobuy), на каждой
+    из выбранных площадок. Первая проверка площадки после включения/смены фильтра — тихая:
+    запоминаем уже существующие лоты, чтобы не скупить старое. Дальше — покупаем по мере появления."""
+    p = rt.profile
     ab = p.get("autobuy") or {}
     if not ab.get("enabled"):
         return
-    source = ab.get("source") or "lzt"
+    autobuy_upgrade(ab)
+    for site in ab["sources"]:
+        try:
+            _check_autobuy_site(bot, rt, ab, site)
+        except Exception:  # noqa: BLE001
+            log.exception("autobuy %s: ошибка у пользователя %s", site, p["user_id"])
+
+
+def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str) -> None:
+    p, state = rt.profile, bot.state
     s = ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)
-    seen = ab.setdefault("seen", [])
+    seen = ab["seen"][site]
     attempts = ab.setdefault("attempts", {})
     seen_set = set(seen)
+    label = AUTOBUY_SITE_LABELS[site]
 
-    if source == "lzt":
+    if site == "lzt":
         client = rt.lzt_ab
         if client is None:
             return
@@ -3037,7 +3068,6 @@ def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
         if client.last_error:
             log.warning("%s/autobuy lzt: %s", p["user_id"], client.last_error)
             return
-        site = "lzt.market"
     else:
         client = rt.tron_ab
         if client is None:
@@ -3046,17 +3076,16 @@ def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
         if client.last_error:
             log.warning("%s/autobuy tron: %s", p["user_id"], client.last_error)
             return
-        site = "tronaccs"
 
     new_items = [i for i in items if int(i["item_id"]) not in seen_set]
 
     # Тихий первый прогон — просто запоминаем, что уже есть.
-    if not ab.get("init"):
-        ab["init"] = True
+    if not ab["init"].get(site):
+        ab["init"][site] = True
         for item in new_items:
             seen.append(int(item["item_id"]))
         state.save()
-        log.info("%s/autobuy: тихая инициализация, запомнил %d лотов", p["user_id"], len(new_items))
+        log.info("%s/autobuy %s: тихая инициализация, запомнил %d лотов", p["user_id"], site, len(new_items))
         return
 
     new_items.sort(key=lambda i: int(i.get("published_date") or 0))
@@ -3075,12 +3104,13 @@ def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
                 pass
 
         # 2) анти-дребезг: не пытаемся купить один и тот же лот дважды в течение часа
-        last = attempts.get(str(item_id))
+        attempt_key = f"{site}:{item_id}"
+        last = attempts.get(attempt_key)
         if last and time.time() - last < 3600:
             continue
 
         # 3) покупаем
-        if source == "lzt":
+        if site == "lzt":
             try:
                 price_int = int(price) if price is not None else None
             except (TypeError, ValueError):
@@ -3088,24 +3118,23 @@ def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
             ok, msg = client.fast_buy(item_id, price_int)
         else:
             ok, msg = client.buy(item_id)
-        attempts[str(item_id)] = time.time()
-        log.info("%s/autobuy %s: лот %d → %s (%s)",
-                 p["user_id"], site, item_id, ok, msg)
+        attempts[attempt_key] = time.time()
+        log.info("%s/autobuy %s: лот %d → %s (%s)", p["user_id"], label, item_id, ok, msg)
 
         chats = rt.chats
         if ok:
             if chats:
-                bot.tg.send_all(chats, f"🤖✅ <b>AutoBuy</b> купил лот {item_id} на {site}.\n\n"
+                bot.tg.send_all(chats, f"🤖✅ <b>AutoBuy</b> купил лот {item_id} на {label}.\n\n"
                                        + format_item(item))
             target = chats[0] if chats else p["user_id"]
             try:
-                bot.send_account_files(rt, target, item_id, site, client=client)
+                bot.send_account_files(rt, target, item_id, label, client=client)
             except Exception:
                 log.exception("autobuy: не удалось отправить файлы лота %d", item_id)
         else:
             if chats:
                 bot.tg.send_all(chats,
-                    f"🤖❌ <b>AutoBuy</b>: не удалось купить лот {item_id} на {site}.\n"
+                    f"🤖❌ <b>AutoBuy</b>: не удалось купить лот {item_id} на {label}.\n"
                     f"Причина: {html.escape(user_error(msg))}\n"
                     f"{item.get('url') or ''}")
 

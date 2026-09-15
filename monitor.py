@@ -30,6 +30,7 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -184,6 +185,7 @@ class State:
         self.initialized = False
         self.subscribers: list[int] = []
         self.tg_offset = 0
+        self.settings: dict = {}           # простые настройки из меню /settings
         self.category: str | None = None   # фильтр, заданный командой /filter
         self.query: str | None = None
         self.tron_enabled: bool | None = None  # /tron on|off; None - как в .env
@@ -200,6 +202,7 @@ class State:
             self.initialized = bool(data.get("initialized", False))
             self.subscribers = [int(x) for x in data.get("subscribers", [])]
             self.tg_offset = int(data.get("tg_offset", 0))
+            self.settings = data.get("settings") or {}
             self.category = data.get("category") or None
             self.query = data.get("query")
             self.tron_enabled = data.get("tron_enabled")
@@ -219,6 +222,7 @@ class State:
                 "initialized": self.initialized,
                 "subscribers": self.subscribers,
                 "tg_offset": self.tg_offset,
+                "settings": self.settings,
                 "category": self.category,
                 "query": self.query,
                 "tron_enabled": self.tron_enabled,
@@ -511,6 +515,13 @@ class Telegram:
             {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {"inline_keyboard": []}},
         )
 
+    def edit_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text[:TELEGRAM_MESSAGE_LIMIT],
+                   "parse_mode": "HTML", "disable_web_page_preview": True}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        self.call("editMessageText", payload)
+
     def answer_callback(self, callback_id: str, text: str = "", alert: bool = False) -> None:
         self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200], "show_alert": alert})
 
@@ -542,6 +553,7 @@ class Bot:
 
     HELP = (
         "Команды:\n"
+        "/settings — настроить фильтр кнопками: страна, контакты, спамблок\n"
         "/start — подписаться на новые лоты\n"
         "/stop — отписаться\n"
         "/status — что мониторится и сколько лотов запомнено\n"
@@ -559,6 +571,191 @@ class Bot:
         self.tg = tg
         self.lzt = lzt
         self.tron = tron
+        self.awaiting: dict[int, str] = {}  # chat_id -> что ждём текстом (например, код страны)
+
+    # ---------- меню /settings ----------
+
+    COUNTRIES = ["UZ", "RU", "KZ", "UA", "BY", "KG", "TJ", "US", "IN", "ID"]
+    CONTACTS = [0, 50, 100, 200, 300, 500, 1000]
+
+    def current_settings(self) -> dict:
+        """Настройки из меню; если их ещё нет, берём из текущего фильтра lzt."""
+        s = self.state.settings
+        if not s:
+            q = dict(parse_qsl(self.cfg.query, keep_blank_values=True))
+            country = (q.get("country[]") or "").upper() or "any"
+            try:
+                contacts = int(q.get("min_contacts") or 0)
+            except ValueError:
+                contacts = 0
+            spam = q.get("spam") if q.get("spam") in ("yes", "no") else "any"
+            s = {"country": country, "contacts": contacts, "spam": spam, "lzt": True, "tron": True}
+            self.state.settings = s
+        return s
+
+    @staticmethod
+    def _label(s: dict) -> str:
+        country = "любая" if s["country"] == "any" else s["country"]
+        spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
+        return f"Страна: {country}\nКонтактов от: {s['contacts']}\nСпамблок: {spam}"
+
+    def settings_keyboard(self, view: str = "main") -> dict:
+        s = self.current_settings()
+        if view == "country":
+            rows, row = [], []
+            for c in self.COUNTRIES:
+                row.append({"text": ("✅ " if s["country"] == c else "") + c, "callback_data": f"set:country:{c}"})
+                if len(row) == 5:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append([{"text": ("✅ " if s["country"] == "any" else "") + "Любая", "callback_data": "set:country:any"},
+                         {"text": "✏️ Другая", "callback_data": "set:country:ask"}])
+            rows.append([{"text": "← Назад", "callback_data": "set:menu:0"}])
+            return {"inline_keyboard": rows}
+        if view == "contacts":
+            row = [{"text": ("✅ " if s["contacts"] == n else "") + str(n), "callback_data": f"set:contacts:{n}"} for n in self.CONTACTS]
+            return {"inline_keyboard": [row[:4], row[4:], [{"text": "✏️ Другое число", "callback_data": "set:contacts:ask"},
+                                                             {"text": "← Назад", "callback_data": "set:menu:0"}]]}
+        if view == "spam":
+            return {"inline_keyboard": [[
+                {"text": ("✅ " if s["spam"] == "no" else "") + "Без спамблока", "callback_data": "set:spam:no"},
+                {"text": ("✅ " if s["spam"] == "yes" else "") + "Со спамблоком", "callback_data": "set:spam:yes"},
+                {"text": ("✅ " if s["spam"] == "any" else "") + "Любой", "callback_data": "set:spam:any"},
+            ], [{"text": "← Назад", "callback_data": "set:menu:0"}]]}
+        country = "любая" if s["country"] == "any" else s["country"]
+        spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
+        rows = [
+            [{"text": f"🌍 Страна: {country}", "callback_data": "set:view:country"}],
+            [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "set:view:contacts"}],
+            [{"text": f"🚫 Спамблок: {spam}", "callback_data": "set:view:spam"}],
+            [{"text": ("✅" if s.get("lzt", True) else "☐") + " lzt.market", "callback_data": "set:site:lzt"},
+             {"text": ("✅" if s.get("tron", True) else "☐") + " tronaccs", "callback_data": "set:site:tron"}],
+            [{"text": "💾 Применить", "callback_data": "set:apply:0"}],
+        ]
+        return {"inline_keyboard": rows}
+
+    def settings_text(self, view: str = "main") -> str:
+        s = self.current_settings()
+        head = "⚙️ <b>Настройки фильтра</b>\n" + html.escape(self._label(s))
+        hints = {
+            "main": "\n\nНажмите на строку, чтобы изменить. Потом «Применить».",
+            "country": "\n\nВыберите страну аккаунта.",
+            "contacts": "\n\nМинимальное число контактов.",
+            "spam": "\n\nСпамблок на аккаунте.",
+        }
+        return head + hints.get(view, "")
+
+    def show_settings(self, chat_id: int, message_id: int | None = None, view: str = "main") -> None:
+        if message_id:
+            self.tg.edit_text(chat_id, message_id, self.settings_text(view), self.settings_keyboard(view))
+        else:
+            self.tg.send(chat_id, self.settings_text(view), self.settings_keyboard(view))
+
+    def apply_settings(self, chat_id: int) -> None:
+        s = self.current_settings()
+        applied = []
+        if s.get("lzt", True):
+            params = []
+            if s["country"] != "any":
+                params.append(("country[]", s["country"]))
+            if s["contacts"] > 0:
+                params.append(("min_contacts", str(s["contacts"])))
+            if s["spam"] != "any":
+                params.append(("spam", s["spam"]))
+            query = "&".join(f"{k}={v}" for k, v in params)
+            self.cfg.category = "telegram"
+            self.cfg.query = query
+            self.state.set_filter("telegram", query)
+            applied.append("lzt.market: " + html.escape(self.cfg.site_url()))
+        if s.get("tron", True):
+            parts = []
+            if s["country"] != "any":
+                parts.append(f"country={s['country']}")
+            if s["contacts"] > 0:
+                parts.append(f"contacts>={s['contacts']}")
+            if s["spam"] != "any":
+                parts.append(f"spam={s['spam']}")
+            text = " ".join(parts)
+            self.cfg.tron_filter = text
+            if self.tron is not None:
+                self.tron.set_filter(text)
+            self.state.set_tron(filter_text=text)
+            applied.append("tronaccs: " + (html.escape(text) or "без фильтра")
+                           + ("" if self.tron else " (сейчас выключен, /tron on)"))
+        self.state.save()
+        log.info("Настройки применены: %s", s)
+        self.tg.send(chat_id, "✅ Применил.\n" + html.escape(self._label(s)) + "\n\n" + "\n".join(applied)
+                     + "\n\nТекущие лоты запомню молча, дальше буду присылать только новые. Проверить: /check")
+
+    def handle_settings_callback(self, cq: dict, parts: list[str]) -> None:
+        cq_id = cq.get("id", "")
+        user_id = (cq.get("from") or {}).get("id")
+        msg = cq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        message_id = msg.get("message_id")
+        if not self.allowed(user_id):
+            self.tg.answer_callback(cq_id, "⛔ Доступ только владельцу", alert=True)
+            return
+        _, kind, value = (parts + ["", ""])[:3]
+        s = self.current_settings()
+        if kind == "view":
+            self.show_settings(chat_id, message_id, value)
+        elif kind == "menu":
+            self.awaiting.pop(chat_id, None)
+            self.show_settings(chat_id, message_id, "main")
+        elif kind == "country":
+            if value == "ask":
+                self.awaiting[chat_id] = "country"
+                self.tg.answer_callback(cq_id)
+                self.tg.send(chat_id, "Пришлите код страны двумя буквами, например <code>UZ</code>. Отмена: /settings")
+                return
+            s["country"] = value.upper()
+            self.state.save()
+            self.show_settings(chat_id, message_id, "main")
+        elif kind == "contacts":
+            if value == "ask":
+                self.awaiting[chat_id] = "contacts"
+                self.tg.answer_callback(cq_id)
+                self.tg.send(chat_id, "Пришлите минимальное число контактов, например <code>150</code>. Отмена: /settings")
+                return
+            s["contacts"] = int(value)
+            self.state.save()
+            self.show_settings(chat_id, message_id, "main")
+        elif kind == "spam":
+            s["spam"] = value
+            self.state.save()
+            self.show_settings(chat_id, message_id, "main")
+        elif kind == "site":
+            s[value] = not s.get(value, True)
+            self.state.save()
+            self.show_settings(chat_id, message_id, "main")
+        elif kind == "apply":
+            self.tg.edit_markup(chat_id, message_id, None)
+            self.apply_settings(chat_id)
+        self.tg.answer_callback(cq_id)
+
+    def handle_awaiting(self, chat_id: int, text: str) -> bool:
+        """Текст в ответ на «Другая страна» / «Другое число». True, если обработали."""
+        kind = self.awaiting.get(chat_id)
+        if not kind:
+            return False
+        s = self.current_settings()
+        if kind == "country":
+            code = text.strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", code):
+                self.tg.send(chat_id, "Нужен код из двух латинских букв, например UZ. Или /settings для отмены.")
+                return True
+            s["country"] = code
+        elif kind == "contacts":
+            if not text.strip().isdigit():
+                self.tg.send(chat_id, "Нужно число, например 150. Или /settings для отмены.")
+                return True
+            s["contacts"] = int(text.strip())
+        self.awaiting.pop(chat_id, None)
+        self.state.save()
+        self.show_settings(chat_id)
+        return True
 
     def allowed(self, user_id: int) -> bool:
         return not self.cfg.tg_user_ids or user_id in self.cfg.tg_user_ids
@@ -603,6 +800,9 @@ class Bot:
         message_id = msg.get("message_id")
         data = cq.get("data") or ""
         parts = data.split(":")
+        if parts[0] == "set" and chat_id is not None:
+            self.handle_settings_callback(cq, parts)
+            return
         if len(parts) != 3 or chat_id is None:
             self.tg.answer_callback(cq_id)
             return
@@ -668,8 +868,13 @@ class Bot:
         chat_id = chat.get("id")
         user_id = user.get("id")
         text = (msg.get("text") or "").strip()
-        if chat_id is None or not text.startswith("/"):
+        if chat_id is None:
             return
+        if not text.startswith("/"):
+            if self.allowed(user_id):
+                self.handle_awaiting(chat_id, text)
+            return
+        self.awaiting.pop(chat_id, None)
         parts = text.split(maxsplit=1)
         command = parts[0].split("@")[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -682,12 +887,14 @@ class Bot:
             self.tg.send(chat_id, "⛔ Этот бот приватный. Доступ только владельцу.")
             return
 
-        if command == "/start":
+        if command in ("/settings", "/menu"):
+            self.show_settings(chat_id)
+        elif command == "/start":
             if self.state.subscribe(chat_id):
                 self.tg.send(
                     chat_id,
                     "✅ Подписал. Буду присылать новые лоты по фильтру:\n"
-                    + html.escape(self.cfg.site_url()) + "\n\n" + self.HELP,
+                    + html.escape(self.cfg.site_url()) + "\n\nНастроить страну, контакты и спамблок: /settings\n\n" + self.HELP,
                 )
             else:
                 self.tg.send(chat_id, "Вы уже подписаны.\n\n" + self.HELP)

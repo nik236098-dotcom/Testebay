@@ -114,7 +114,7 @@ class TextTests(unittest.TestCase):
         tron = monitor.TronClient('offline-test', '', {}, pages=1)
         tron.api.me = Mock(return_value={"id": 1, "balance": 0})
         self.assertNotIn('None', tron.check_token()[1])
-        self.assertEqual(tron.balance(), '0')
+        self.assertEqual(tron.balance(), '0 ₽')
 
 
 class TokenTests(unittest.TestCase):
@@ -124,7 +124,9 @@ class TokenTests(unittest.TestCase):
         bot.tg = Mock()
         bot.state = SimpleNamespace(save=Mock(), country_ids={})
         bot.cfg = SimpleNamespace(tron_category='telegram')
-        bot.jobs, bot.awaiting = {}, {}
+        bot.jobs, bot.awaiting, bot.active_pages = {}, {}, {}
+        bot.tg.send_screen.return_value = 99
+        bot.tg.edit_text.return_value = True
         bot.jobs_lock, bot.flow_lock = threading.RLock(), threading.RLock()
         bot.profile = Mock(return_value=profile)
         bot.finish_setup = Mock()
@@ -182,7 +184,11 @@ class TokenTests(unittest.TestCase):
         bot.is_owner = Mock(return_value=False)
         for command in ('/start', '/help', '/unknown'):
             bot.handle({'message': {'chat': {'id': 10}, 'from': {'id': 1}, 'text': command}})
-            self.assertIn('/settings', CheckedHTML(bot.tg.send.call_args.args[1]).visible)
+            if command == '/start':
+                self.assertIn('Главное меню', bot.tg.send_screen.call_args.args[1])
+            else:
+                self.assertTrue(bot.tg.edit_text.called)
+        self.assertEqual(bot.tg.send_screen.call_count, 1)
 
     def test_command_exception_notifies_user(self):
         bot, _ = self.make_bot()

@@ -41,6 +41,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 import requests
 
 from bot_text import display_value, readable, split_html, user_error
+from bot_menu import country_name, criteria, lzt_criteria, money, price_text, settings_from_query, tron_criteria
 
 from tron_source import TronApiClient, TronError, build_params, match_filter, parse_filter
 from web_source import WebSourceError, fetch_items_web
@@ -342,6 +343,19 @@ class LztClient:
             return True, f"{display_value(user.get('username') or user.get('user_id'), 'пользователь')}, баланс {display_value(user.get('balance'), 'недоступен')} ₽"
         return True, "ок"
 
+    def balance(self) -> str:
+        try:
+            resp = self.session.get(f"{API_BASE}/me", timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            user = data.get("user") if isinstance(data, dict) else None
+            if not isinstance(user, dict):
+                return "Не удалось получить баланс. Попробуйте позже."
+            return money(user.get("balance"), user.get("currency") or "RUB")
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Не удалось получить баланс lzt: %s", exc)
+            return user_error(exc)
+
     def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
         """retries=1 — один быстрый запрос без пауз (для команд из чата), 5 — с повторами (для монитора)."""
         url = f"{API_BASE}/{category}"
@@ -514,7 +528,7 @@ class TronClient:
             user = self.api.me()
         except (TronError, requests.RequestException) as exc:
             return user_error(exc)
-        return f"{display_value(user.get('balance'), 'недоступен')} {str(user.get('currency') or '').upper()}".strip() if user else None
+        return money(user.get("balance"), user.get("currency") or "RUB") if user else "Баланс недоступен"
 
     def find_country_id(self, code: str, max_id: int = 300, progress=None) -> int | None:
         code = code.upper()
@@ -549,8 +563,10 @@ class Telegram:
     def __init__(self, bot_token: str) -> None:
         self.base = f"{TG_API}/bot{bot_token}"
         self.session = requests.Session()
+        self.result_state = threading.local()
 
     def call(self, method: str, payload: dict) -> dict | None:
+        self.result_state.description = ""
         for attempt in range(1, 4):
             try:
                 resp = self.session.post(f"{self.base}/{method}", json=payload, timeout=30)
@@ -568,6 +584,9 @@ class Telegram:
                 continue
             if resp.ok and data.get("ok"):
                 return data.get("result") or {}
+            if method in ("editMessageText", "editMessageReplyMarkup") and "message is not modified" in str(data.get("description", "")).lower():
+                return {}
+            self.result_state.description = str(data.get("description", ""))
             if method != "deleteMessage":
                 log.error("Telegram %s: ответ %d: %s", method, resp.status_code, resp.text[:300])
             return None
@@ -583,6 +602,24 @@ class Telegram:
             if self.call("sendMessage", payload) is None:
                 return False
         return bool(chunks)
+
+    def can_recreate_screen(self) -> bool:
+        description = getattr(self.result_state, "description", "").lower()
+        return "message to edit not found" in description or "message can't be edited" in description
+
+    def send_screen(self, chat_id: int, text: str, reply_markup: dict) -> int | None:
+        # Menu pages are deliberately compact; longer content still keeps valid HTML.
+        chunks = split_html(text, TELEGRAM_MESSAGE_LIMIT)
+        message_id = None
+        for index, chunk in enumerate(chunks):
+            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True}
+            if index == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup
+            result = self.call("sendMessage", payload)
+            if result is None:
+                return None
+            message_id = result.get("message_id")
+        return message_id
 
     def send_all(self, chat_ids: list[int], text: str, reply_markup: dict | None = None) -> int:
         return sum(1 for c in list(chat_ids) if self.send(c, text, reply_markup))
@@ -610,16 +647,19 @@ class Telegram:
             return False
         return False
 
-    def edit_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    def edit_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> bool:
         chunks = split_html(text, TELEGRAM_MESSAGE_LIMIT)
         if not chunks:
-            return
+            return False
         payload = {"chat_id": chat_id, "message_id": message_id, "text": chunks[0],
                    "parse_mode": "HTML", "disable_web_page_preview": True,
                    "reply_markup": reply_markup if len(chunks) == 1 and reply_markup else {"inline_keyboard": []}}
-        self.call("editMessageText", payload)
+        if self.call("editMessageText", payload) is None:
+            return False
         for index, chunk in enumerate(chunks[1:], start=1):
-            self.send(chat_id, chunk, reply_markup if index == len(chunks) - 1 else None)
+            if not self.send(chat_id, chunk, reply_markup if index == len(chunks) - 1 else None):
+                return False
+        return True
 
     def edit_markup(self, chat_id: int, message_id: int, reply_markup: dict | None) -> None:
         self.call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id,
@@ -1148,7 +1188,9 @@ class UserRuntime:
 
     def rebuild(self) -> None:
         p = self.profile
-        if p.get("source") == "web":
+        if not p.get("lzt_enabled", True):
+            self.lzt = None
+        elif p.get("source") == "web":
             self.lzt = WebClient(self.cfg.cookies, self.cfg.use_browser)
         elif p.get("lzt_token"):
             self.lzt = LztClient(p["lzt_token"])
@@ -1177,6 +1219,8 @@ class UserRuntime:
 class Bot:
     HELP = (
         "Команды:\n"
+        "/menu — главное меню с кнопками\n"
+        "/balance — балансы обеих площадок\n"
         "/settings — настроить фильтр кнопками: страна, контакты, спамблок\n"
         "/check — проверить прямо сейчас и показать последние лоты\n"
         "/status — что мониторится, балансы, последняя проверка\n"
@@ -1209,6 +1253,7 @@ class Bot:
         self.jobs: dict[tuple[int, str], threading.Thread] = {}  # (user_id, команда) -> поток
         self.jobs_lock = threading.RLock()
         self.flow_lock = threading.RLock()
+        self.active_pages: dict[tuple, tuple] = {}
         for p in list(state.users.values()):
             self.runtime(p["user_id"])
 
@@ -1227,7 +1272,15 @@ class Bot:
                     target(*args)
                 except Exception:  # noqa: BLE001
                     log.exception("Ошибка в команде %s пользователя %s", name, user_id)
-                    self.tg.send(chat_id, "⚠️ Не удалось выполнить команду. Попробуйте ещё раз или откройте /help.")
+                    p = self.profile(user_id)
+                    if p is not None and name.startswith(("/balances:", "/check:")):
+                        with self.flow_lock:
+                            page, mid = self.active_pages.get((user_id, chat_id), (None, None))
+                            if page in ("balances", "check"):
+                                self.show_page(p, chat_id, "⚠️ Не удалось загрузить данные. Попробуйте ещё раз позже.",
+                                               self.menu_keyboard(), "error", mid)
+                    else:
+                        self.tg.send(chat_id, "⚠️ Не удалось выполнить команду. Попробуйте ещё раз или откройте /help.")
 
             job = threading.Thread(target=runner, name=f"cmd-{name.lstrip('/').replace(' ', '_')}-{user_id}", daemon=True)
             self.jobs[key] = job
@@ -1266,44 +1319,135 @@ class Bot:
             self.runtime(owner)
             log.info("Создан профиль владельца %s из .env", owner)
 
+    @staticmethod
+    def menu_keyboard() -> dict:
+        return {"inline_keyboard": [
+            [{"text": "💳 Балансы площадок", "callback_data": "nav:balances"},
+             {"text": "📊 Статус", "callback_data": "nav:status"}],
+            [{"text": "⚙️ Настройки поиска", "callback_data": "nav:settings"}],
+            [{"text": "🔎 Проверить сейчас", "callback_data": "nav:check"}],
+        ]}
+
+    @staticmethod
+    def back_keyboard(refresh: str | None = None) -> dict:
+        rows = []
+        if refresh:
+            rows.append([{"text": "🔄 Обновить", "callback_data": "nav:" + refresh}])
+        rows.append([{"text": "🏠 Главное меню", "callback_data": "nav:home"}])
+        return {"inline_keyboard": rows}
+
+    def show_page(self, p: dict, chat_id: int, text: str, keyboard: dict,
+                  page: str, message_id: int | None = None) -> int | None:
+        messages = p.setdefault("menu_messages", {})
+        message_id = message_id or messages.get(str(chat_id))
+        self.active_pages[(p["user_id"], chat_id)] = (page, message_id)
+        if message_id:
+            if not self.tg.edit_text(chat_id, message_id, text, keyboard):
+                if not self.tg.can_recreate_screen():
+                    return None
+                message_id = None
+        if not message_id:
+            message_id = self.tg.send_screen(chat_id, text, keyboard)
+        if message_id is not None:
+            self.active_pages[(p["user_id"], chat_id)] = (page, message_id)
+            if messages.get(str(chat_id)) != message_id:
+                messages[str(chat_id)] = message_id
+                self.state.save()
+        return message_id
+
+    def show_menu(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
+        self.awaiting.pop(chat_id, None)
+        name = p.get("name") or "друг"
+        if name == "owner":
+            name = "владелец"
+        enabled = chat_id in p.get("chats", [])
+        text = ("🏠 <b>Главное меню</b>\n\n"
+                + "Привет, " + html.escape(name) + "!\n"
+                + ("🔔 Уведомления о новых аккаунтах включены." if enabled else "🔕 Уведомления в этом чате выключены. Включить: /start")
+                + "\n\n💳 <b>Балансы</b> — деньги на обеих площадках."
+                + "\n⚙️ <b>Настройки</b> — страна, контакты, спамблок и цена."
+                + "\n📊 <b>Статус</b> — текущие условия поиска и результаты."
+                + "\n🔎 <b>Проверить сейчас</b> — показать подходящие аккаунты.")
+        self.show_page(p, chat_id, text, self.menu_keyboard(), "home", message_id)
+
+    def show_balances(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
+        message_id = self.show_page(p, chat_id, "💳 <b>Балансы площадок</b>\n\nЗапрашиваю актуальные данные…",
+                       self.back_keyboard(), "balances", message_id)
+        if message_id is None:
+            return
+        name = f"/balances:{chat_id}:{message_id}"
+        with self.jobs_lock:
+            job = self.jobs.get((p["user_id"], name))
+            if job is None or not job.is_alive():
+                self.run_in_background(p["user_id"], name, chat_id, self.load_balances, p, chat_id, message_id)
+
+    def load_balances(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
+        lines = ["💳 <b>Балансы площадок</b>"]
+        for key, label in (("lzt_token", "lzt.market"), ("tron_token", "tronaccs")):
+            token = p.get(key)
+            if not token:
+                value = "Не подключена — добавьте ключ доступа через /token"
+            else:
+                try:
+                    client = LztClient(token) if key == "lzt_token" else TronClient(token, "", {}, self.cfg.tron_category, 1)
+                    value = client.balance() or "Баланс недоступен"
+                except Exception as exc:
+                    log.exception("Ошибка получения баланса %s", label)
+                    value = user_error(exc)
+            lines.append("\n<b>" + label + "</b>\n" + html.escape(value))
+        lines.append("\nЭто отдельные балансы площадок. Деньги между ними не объединяются.")
+        with self.flow_lock:
+            if self.profile(p["user_id"]) is not p or self.active_pages.get((p["user_id"], chat_id)) != ("balances", message_id):
+                return
+            self.show_page(p, chat_id, "\n".join(lines), self.back_keyboard("balances"), "balances", message_id)
+
+    def handle_navigation(self, cq: dict) -> None:
+        uid = (cq.get("from") or {}).get("id")
+        p = self.profile(uid)
+        msg = cq.get("message") or {}
+        chat_id, message_id = (msg.get("chat") or {}).get("id"), msg.get("message_id")
+        if p is None or chat_id is None:
+            self.tg.answer_callback(cq.get("id", ""), "Нет доступа к этому боту.", alert=True)
+            return
+        self.tg.answer_callback(cq.get("id", ""))
+        self.awaiting.pop(chat_id, None)
+        action = (cq.get("data") or "").split(":", 1)[-1]
+        if action == "settings":
+            self.show_settings(p, chat_id, message_id)
+        elif action == "status":
+            self.cmd_status(p, self.runtime(uid), chat_id, message_id)
+        elif action == "balances":
+            self.show_balances(p, chat_id, message_id)
+        elif action == "check":
+            self.start_check(p, self.runtime(uid), chat_id, message_id)
+        else:
+            self.show_menu(p, chat_id, message_id)
+
     # --- меню /settings ---
 
     def current_settings(self, p: dict) -> dict:
         s = p.get("settings") or {}
         if not s:
-            q = dict(parse_qsl(p.get("query") or "", keep_blank_values=True))
-            country = (q.get("country[]") or "").upper() or "any"
-            try:
-                contacts = int(q.get("min_contacts") or 0)
-            except ValueError:
-                contacts = 0
-            spam = q.get("spam") if q.get("spam") in ("yes", "no") else "any"
-            s = {"country": country, "contacts": contacts, "spam": spam, "lzt": True, "tron": True}
+            s = settings_from_query(p.get("query") or "")
+            s.update({"lzt": p.get("lzt_enabled", True), "tron": p.get("tron_enabled", True)})
             p["settings"] = s
         return s
 
     @staticmethod
     def _price_text(s: dict) -> str:
-        lo, hi = s.get("price_min"), s.get("price_max")
-        if lo is None and hi is None:
-            return "любая"
-        if lo is not None and hi is not None:
-            return f"от {lo} до {hi} ₽"
-        return f"от {lo} ₽" if lo is not None else f"до {hi} ₽"
+        return price_text(s)
 
     @classmethod
     def _label(cls, s: dict) -> str:
-        country = "любая" if s["country"] == "any" else s["country"]
-        spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
-        return f"Страна: {country}\nКонтактов от: {s['contacts']}\nСпамблок: {spam}\nЦена: {cls._price_text(s)}"
+        return criteria(s)
 
     def settings_keyboard(self, p: dict, view: str = "main") -> dict:
         s = self.current_settings(p)
         if view == "country":
             rows, row = [], []
             for c in self.COUNTRIES:
-                row.append({"text": ("✅ " if s["country"] == c else "") + c, "callback_data": f"set:country:{c}"})
-                if len(row) == 5:
+                row.append({"text": ("✅ " if s["country"] == c else "") + country_name(c), "callback_data": f"set:country:{c}"})
+                if len(row) == 2:
                     rows.append(row); row = []
             if row:
                 rows.append(row)
@@ -1331,7 +1475,7 @@ class Bot:
                 [{"text": ("✅ " if lo is None and hi is None else "") + "Любая цена", "callback_data": "set:price_clear:0"},
                  {"text": "← Назад", "callback_data": "set:menu:0"}],
             ]}
-        country = "любая" if s["country"] == "any" else s["country"]
+        country = country_name(s["country"])
         spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
         return {"inline_keyboard": [
             [{"text": f"🌍 Страна: {country}", "callback_data": "set:view:country"}],
@@ -1340,27 +1484,30 @@ class Bot:
             [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "set:view:price"}],
             [{"text": ("✅" if s.get("lzt", True) else "☐") + " lzt.market", "callback_data": "set:site:lzt"},
              {"text": ("✅" if s.get("tron", True) else "☐") + " tronaccs", "callback_data": "set:site:tron"}],
-            [{"text": "💾 Применить", "callback_data": "set:apply:0"}],
+            [{"text": "💾 Сохранить условия", "callback_data": "set:apply:0"}],
+            [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
         ]}
 
     def settings_text(self, p: dict, view: str = "main") -> str:
         s = self.current_settings(p)
-        hints = {"main": "\n\nНажмите на строку, чтобы изменить. Потом «Применить».",
+        hints = {"main": "\n\nНажмите на строку, чтобы изменить. Затем нажмите «Сохранить условия».",
                  "country": "\n\nВыберите страну аккаунта.", "contacts": "\n\nМинимальное число контактов.",
                  "spam": "\n\nСпамблок на аккаунте.",
                  "price": "\n\nЦена в рублях. На tronaccs считается с комиссией."}
-        return "⚙️ <b>Настройки фильтра</b>\n" + html.escape(self._label(s)) + hints.get(view, "")
+        return "⚙️ <b>Настройки поиска</b>\n\n" + html.escape(self._label(s)) + hints.get(view, "")
 
     def show_settings(self, p: dict, chat_id: int, message_id: int | None = None, view: str = "main") -> None:
-        if message_id:
-            self.tg.edit_text(chat_id, message_id, self.settings_text(p, view), self.settings_keyboard(p, view))
-        else:
-            self.tg.send(chat_id, self.settings_text(p, view), self.settings_keyboard(p, view))
+        self.show_page(p, chat_id, self.settings_text(p, view), self.settings_keyboard(p, view), "settings", message_id)
 
-    def apply_settings(self, p: dict, chat_id: int) -> None:
+    def apply_settings(self, p: dict, chat_id: int, message_id: int | None = None) -> None:
         s = self.current_settings(p)
         rt = self.runtime(p["user_id"])
-        applied = []
+        if s.get("price_min") is not None and s.get("price_max") is not None and s["price_min"] > s["price_max"]:
+            self.show_page(p, chat_id, "⚠️ Минимальная цена больше максимальной. Исправьте диапазон цены.",
+                           self.settings_keyboard(p, "price"), "settings", message_id)
+            return
+        p["lzt_enabled"] = bool(s.get("lzt", True))
+        p["tron_enabled"] = bool(s.get("tron", True))
         if s.get("lzt", True):
             params = []
             if s["country"] != "any":
@@ -1376,7 +1523,6 @@ class Bot:
             p["category"] = "telegram"
             p["query"] = "&".join(f"{k}={v}" for k, v in params)
             self.state.reset_seen(p, "lzt")
-            applied.append("lzt.market: " + html.escape(lzt_site_url(p)))
         if s.get("tron", True):
             parts = []
             if s["country"] != "any":
@@ -1391,14 +1537,20 @@ class Bot:
                 parts.append(f"price<={s['price_max']}")
             p["tron_filter"] = " ".join(parts)
             self.state.reset_seen(p, "tron")
-            applied.append("tronaccs: " + (html.escape(p["tron_filter"]) or "без фильтра")
-                           + ("" if p.get("tron_token") else " (нет токена tronaccs, см. /token)"))
         self.state.save()
         if rt:
             rt.rebuild()
         log.info("Пользователь %s применил настройки: %s", p["user_id"], s)
-        self.tg.send(chat_id, "✅ Применил.\n" + html.escape(self._label(s)) + "\n\n" + "\n".join(applied)
-                     + "\n\nТекущие лоты запомню молча, дальше буду присылать только новые. Проверить: /check")
+        if rt:
+            for key in ("last_items", "tron_items"):
+                rt.stats[key] = None
+            for name in ("lzt", "tron"):
+                rt.stats.pop(name + "_last_ok", None)
+                rt.stats.pop(name + "_checked_at", None)
+        self.show_page(p, chat_id, "✅ <b>Условия поиска сохранены</b>\n\n"
+                       + html.escape(self._label(s))
+                       + "\n\nСтарые аккаунты будут учтены при следующей проверке. Уведомления придут о новых.",
+                       self.menu_keyboard(), "saved", message_id)
 
     def handle_settings_callback(self, cq: dict, parts: list[str]) -> None:
         cq_id = cq.get("id", "")
@@ -1421,16 +1573,18 @@ class Bot:
             if value == "ask":
                 self.awaiting[chat_id] = (user_id, "country")
                 self.tg.answer_callback(cq_id)
-                self.tg.send(chat_id, "Пришлите код страны двумя буквами, например <code>UZ</code>. Отмена: /settings")
+                self.show_page(p, chat_id, "🌍 <b>Выбор страны</b>\n\nПришлите код страны двумя буквами, например <code>UZ</code> — Узбекистан.",
+                               {"inline_keyboard": [[{"text": "← К настройкам", "callback_data": "nav:settings"}]]}, "settings", message_id)
                 return
-            s["country"] = value.upper()
+            s["country"] = "any" if value.lower() == "any" else value.upper()
             self.state.save()
             self.show_settings(p, chat_id, message_id, "main")
         elif kind == "contacts":
             if value == "ask":
                 self.awaiting[chat_id] = (user_id, "contacts")
                 self.tg.answer_callback(cq_id)
-                self.tg.send(chat_id, "Пришлите минимальное число контактов, например <code>150</code>. Отмена: /settings")
+                self.show_page(p, chat_id, "👥 <b>Количество контактов</b>\n\nПришлите минимальное число контактов, например <code>150</code>.",
+                               {"inline_keyboard": [[{"text": "← К настройкам", "callback_data": "nav:settings"}]]}, "settings", message_id)
                 return
             s["contacts"] = int(value)
             self.state.save()
@@ -1443,10 +1597,10 @@ class Bot:
             if value == "ask":
                 self.awaiting[chat_id] = (user_id, kind)
                 self.tg.answer_callback(cq_id)
-                self.tg.send(chat_id, ("Пришлите минимальную цену в рублях, например <code>100</code>."
-                                       if kind == "price_min" else
-                                       "Пришлите максимальную цену в рублях, например <code>500</code>.")
-                             + "\n0 — убрать это ограничение. Отмена: /settings")
+                self.show_page(p, chat_id, ("Пришлите минимальную цену в рублях, например <code>100</code>."
+                                            if kind == "price_min" else "Пришлите максимальную цену в рублях, например <code>500</code>.")
+                               + "\n0 — убрать это ограничение.",
+                               {"inline_keyboard": [[{"text": "← К настройкам", "callback_data": "nav:settings"}]]}, "settings", message_id)
                 return
             s[kind] = int(value)
             self.state.save()
@@ -1461,8 +1615,7 @@ class Bot:
             self.state.save()
             self.show_settings(p, chat_id, message_id, "main")
         elif kind == "apply":
-            self.tg.edit_markup(chat_id, message_id, None)
-            self.apply_settings(p, chat_id)
+            self.apply_settings(p, chat_id, message_id)
         self.tg.answer_callback(cq_id)
 
     # --- кнопки под лотом ---
@@ -1501,6 +1654,9 @@ class Bot:
         message_id = msg.get("message_id")
         data = cq.get("data") or ""
         parts = data.split(":")
+        if parts[0] == "nav":
+            self.handle_navigation(cq)
+            return
         if parts[0] == "set" and chat_id is not None:
             self.handle_settings_callback(cq, parts)
             return
@@ -1695,7 +1851,7 @@ class Bot:
         rt = self.runtime(p["user_id"])
         if rt:
             rt.rebuild()
-        self.tg.send(chat_id, "Готово. Настройте фильтр кнопками и нажмите «Применить»:")
+        self.tg.send(chat_id, "Готово. Настройте поиск кнопками и нажмите «Сохранить условия»:")
         self.show_settings(p, chat_id)
 
     # --- обработка обновлений ---
@@ -1724,6 +1880,8 @@ class Bot:
             pending = self.awaiting.get(chat_id)
             if pending and pending[0] == user_id and p is not None:
                 self.handle_awaiting(p, chat_id, pending[1], text, message_id)
+            elif p is not None:
+                self.show_menu(p, chat_id)
             return
 
         parts = text.split(maxsplit=1)
@@ -1755,23 +1913,27 @@ class Bot:
         self.awaiting.pop(chat_id, None)
         rt = self.runtime(user_id)
 
-        if command in ("/settings", "/menu"):
+        if command == "/settings":
             self.show_settings(p, chat_id)
+        elif command == "/menu":
+            self.show_menu(p, chat_id)
+        elif command in ("/balance", "/balances"):
+            self.show_balances(p, chat_id)
         elif command == "/start":
             if chat_id not in p["chats"]:
                 p["chats"].append(chat_id)
                 self.state.save()
-            self.tg.send(chat_id, "✅ Этот чат подписан на ваши лоты.\n" + self.HELP
-                         + (self.OWNER_HELP if self.is_owner(user_id) else ""))
+            self.show_menu(p, chat_id)
         elif command == "/stop":
             if chat_id in p["chats"]:
                 p["chats"].remove(chat_id)
                 self.state.save()
-                self.tg.send(chat_id, "🔕 Отписал этот чат. Вернуть: /start")
+                self.show_menu(p, chat_id)
             else:
-                self.tg.send(chat_id, "Этот чат и так не подписан. Подписать: /start")
+                self.show_menu(p, chat_id)
         elif command == "/help":
-            self.tg.send(chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""))
+            self.show_page(p, chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""),
+                           self.back_keyboard(), "help")
         elif command == "/token":
             self.cmd_token(p, chat_id, arg, message_id)
         elif command == "/panel":
@@ -1781,9 +1943,9 @@ class Bot:
         elif command == "/filter":
             self.cmd_filter(p, chat_id, arg)
         elif command == "/check":
-            self.run_in_background(user_id, command, chat_id, self.cmd_check, p, rt, chat_id)
+            self.start_check(p, rt, chat_id)
         elif command == "/status":
-            self.run_in_background(user_id, command, chat_id, self.cmd_status, p, rt, chat_id)
+            self.cmd_status(p, rt, chat_id)
         elif command == "/tron":
             self.cmd_tron(p, rt, chat_id, arg)
         elif command == "/tronfilter":
@@ -1828,7 +1990,7 @@ class Bot:
             else:
                 self.tg.send(chat_id, "Такого пользователя нет.")
         else:
-            self.tg.send(chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""))
+            self.show_menu(p, chat_id)
 
     def handle_awaiting(self, p: dict, chat_id: int, kind: str, text: str, message_id: int | None) -> None:
         if kind == "eva_token":
@@ -1863,18 +2025,18 @@ class Bot:
         if kind == "country":
             code = text.strip().upper()
             if not re.fullmatch(r"[A-Z]{2}", code):
-                self.tg.send(chat_id, "Нужен код из двух латинских букв, например UZ. Или /settings для отмены.")
+                self.show_page(p, chat_id, "Нужен код из двух латинских букв, например UZ. Или /settings для отмены.", self.back_keyboard(), "settings")
                 return
             s["country"] = code
         elif kind == "contacts":
             if not text.strip().isdigit():
-                self.tg.send(chat_id, "Нужно число, например 150. Или /settings для отмены.")
+                self.show_page(p, chat_id, "Нужно число, например 150. Или /settings для отмены.", self.back_keyboard(), "settings")
                 return
             s["contacts"] = int(text.strip())
         elif kind in ("price_min", "price_max"):
             digits = text.strip().replace(" ", "")
             if not digits.isdigit():
-                self.tg.send(chat_id, "Нужно число в рублях, например 500. 0 — убрать ограничение. Или /settings для отмены.")
+                self.show_page(p, chat_id, "Нужно число в рублях, например 500. 0 — убрать ограничение. Или /settings для отмены.", self.back_keyboard(), "settings")
                 return
             s[kind] = int(digits) or None
         self.awaiting.pop(chat_id, None)
@@ -2137,43 +2299,64 @@ class Bot:
                      + (f"\nПоследняя ошибка ({_ago(rt.stats['last_error_at'])}): {html.escape(user_error(err))}" if err else ""))
         return False
 
-    def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+    def start_check(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
+        message_id = self.show_page(p, chat_id, "🔎 <b>Проверка аккаунтов</b>\n\nЗапрашиваю данные площадок…",
+                                    self.back_keyboard(), "check", message_id)
+        if message_id is None:
+            return
+        name = f"/check:{chat_id}"
+        with self.jobs_lock:
+            job = self.jobs.get((p["user_id"], name))
+            if job is None or not job.is_alive():
+                self.run_in_background(p["user_id"], name, chat_id, self.cmd_check, p, rt, chat_id, message_id)
+
+    def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
         if rt is None:
             return
-        self.tg.send(chat_id, "🔎 Проверяю…")
-        if not self.acquire_check(rt, chat_id):
-            return
-        try:
-            # Ручная проверка: один запрос без повторов и пауз, ошибку показываем сразу
-            if rt.lzt is None:
-                self.tg.send(chat_id, "lzt.market: нет токена. Добавить: /token lzt")
-            else:
-                rt.lzt.last_error = None
-                items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
-                if not items:
-                    err = rt.lzt.last_error
-                    rt.record_error(err)
-                    self.tg.send(chat_id, "lzt.market: по фильтру ничего не найдено"
-                                 + (f" или сайт не ответил: {html.escape(user_error(err))}" if err else "."))
-                else:
+        lines = ["🔎 <b>Результат проверки</b>"]
+        rows = []
+        if not rt.lock.acquire(timeout=20):
+            lines.append("\nПлановая проверка ещё выполняется. Попробуйте через минуту.")
+        else:
+            try:
+                for name, label, client in (("lzt", "lzt.market", rt.lzt), ("tron", "tronaccs", rt.tron)):
+                    lines.append("\n<b>" + label + "</b>")
+                    if client is None:
+                        lines.append("Поиск выключен или площадка не подключена.")
+                        continue
+                    client.last_error = None
+                    items = client.fetch_items(p["category"], lzt_params(p["query"]), retries=1) if name == "lzt" else client.fetch_items(retries=1)
+                    error = client.last_error
+                    rt.record_error(error)
+                    rt.stats[name + "_last_ok"] = not error
+                    rt.stats[name + "_last_error"] = error
+                    rt.stats[name + "_checked_at"] = time.time()
+                    rt.stats["last_items" if name == "lzt" else "tron_items"] = len(items)
+                    rt.stats["last_new" if name == "lzt" else "tron_new"] = sum(int(i["item_id"]) not in p["seen"][name] for i in items)
+                    if name == "tron":
+                        rt.stats["tron_total"] = client.last_total
+                    if error:
+                        lines.append("⚠️ " + html.escape(user_error(error)))
+                        continue
+                    lines.append(f"Подходящих в полученной выборке: <b>{len(items)}</b>")
+                    if not items:
+                        lines.append("Ничего не найдено. Проверьте страну, контакты и ограничение цены.")
                     latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
-                    self.tg.send(chat_id, f"lzt.market: лотов на первой странице {len(items)}. Последние:")
                     for item in latest:
-                        self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
-            if rt.tron is not None:
-                rt.tron.last_error = None
-                items = rt.tron.fetch_items(retries=1)
-                if not items:
-                    err = rt.tron.last_error
-                    rt.record_error(err)
-                    self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр не подошёл ни один"
-                                 + (f". Сайт не ответил: {html.escape(user_error(err))}" if err else ". Поля лота: /trondump"))
-                else:
-                    self.tg.send(chat_id, f"tronaccs: получено лотов {rt.tron.last_total}, под фильтр подходят {len(items)}. Последние:")
-                    for item in items[:3]:
-                        self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
-        finally:
-            rt.lock.release()
+                        title = str(item.get("title") or "Аккаунт №" + str(item["item_id"]))[:80]
+                        lines.append("• " + html.escape(title) + " — " + html.escape(money(item.get("price"), item.get("price_currency") or "RUB")))
+                        # Reuse the existing validated item URL; keep manual results in one message.
+                        for row in self.item_keyboard(rt, item).get("inline_keyboard", []):
+                            for button in row:
+                                if button.get("url"):
+                                    rows.append([{"text": label + " · открыть №" + str(item["item_id"]), "url": button["url"]}])
+                                    break
+            finally:
+                rt.lock.release()
+        rows.extend(self.menu_keyboard()["inline_keyboard"])
+        with self.flow_lock:
+            if self.profile(p["user_id"]) is p and self.active_pages.get((p["user_id"], chat_id)) == ("check", message_id):
+                self.show_page(p, chat_id, "\n".join(lines), {"inline_keyboard": rows}, "check", message_id)
 
     def cmd_lztdump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
         if not rt or rt.lzt is None:
@@ -2212,43 +2395,51 @@ class Bot:
         self.tg.send(chat_id, f"tronaccs: лотов на первой странице {count}. Первый как есть:\n<pre>"
                      + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
 
-    def cmd_status(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+    def cmd_status(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
         if rt is None:
+            self.show_menu(p, chat_id, message_id)
             return
-        st = rt.stats
-        lines = [
-            f"👤 {html.escape(p['name'])}" + (" 👑" if self.is_owner(p['user_id']) else ""),
-            "🏪 lzt.market: " + ("выключен, нет токена" if rt.lzt is None else ("страница сайта" if isinstance(rt.lzt, WebClient) else "API"))
-            + "\n   фильтр: " + html.escape(lzt_site_url(p)),
-            "🏪 tronaccs: " + (("включён, фильтр: " + (html.escape(p.get("tron_filter") or "") or "нет")) if rt.tron
-                              else ("выключен" if p.get("tron_token") else "нет токена")),
-            f"💬 Подписанных чатов: {len(p['chats'])}" + (" (этот чат подписан ✅)" if chat_id in p["chats"] else " (этот чат не подписан)"),
-            f"⏱ Проверка каждые {self.cfg.poll_interval} с, проверок: {st['checks']}, последняя: {_ago(st['last_check_at'])}",
-        ]
-        if st["last_items"] is not None:
-            lines.append(f"📡 lzt.market: лотов по фильтру {st['last_items']}, новых в последней проверке {st['last_new']}")
-            meta = rt.lzt.last_meta if rt.lzt else {}
-            if meta.get("totalItems") is not None:
-                lines.append(f"   всего на маркете по фильтру: {meta['totalItems']}, из кэша: {'да' if meta.get('wasCached') else 'нет'}")
-        if st["tron_items"] is not None:
-            lines.append(f"📡 tronaccs: получено {st['tron_total']}, под фильтр {st['tron_items']}, новых {st['tron_new']}")
-        if rt.tron is not None:
-            bal = rt.tron.balance()
-            if bal:
-                lines.append(f"💳 Баланс tronaccs: {html.escape(bal)}")
-        for name, label, client in (("lzt", "lzt.market", rt.lzt), ("tron", "tronaccs", rt.tron)):
-            if client is None or f"{name}_last_ok" not in st:
+        st = dict(rt.stats)
+        lines = ["📊 <b>Статус мониторинга</b>",
+                 "\n🔔 Уведомления: " + ("включены" if chat_id in p.get("chats", []) else "выключены в этом чате"),
+                 f"⏱ Интервал проверки: {self.cfg.poll_interval} сек."]
+        for name, label, client, count_key, new_key in (("lzt", "lzt.market", rt.lzt, "last_items", "last_new"),
+                                                       ("tron", "tronaccs", rt.tron, "tron_items", "tron_new")):
+            lines.append("\n<b>" + label + "</b>")
+            if not p.get(name + "_enabled", True):
+                lines.append("⏸ Поиск на площадке выключен")
                 continue
-            since = st.get(f"{name}_down_since")
-            if since:
-                lines.append(f"⛔ {label} не отвечает уже {_duration(time.time() - since)}")
-            elif st[f"{name}_last_ok"]:
-                lines.append(f"✅ {label} отвечает")
-            else:
-                lines.append(f"⚠️ {label}: последняя проверка с ошибкой")
-        if st["last_error"]:
-            lines.append(f"⚠️ Последняя ошибка ({_ago(st['last_error_at'])}): " + html.escape(user_error(st["last_error"])))
-        self.tg.send(chat_id, "\n".join(lines))
+            if client is None:
+                lines.append("🔑 Площадка не подключена — добавьте ключ через /token")
+                continue
+            ok = st.get(name + "_last_ok")
+            lines.append("✅ Последняя проверка успешна" if ok is True else
+                         "⚠️ Не удалось выполнить последнюю проверку" if ok is False else "⏳ Ожидаю первую проверку по этим условиям")
+            try:
+                summary = lzt_criteria(p.get("query")) if name == "lzt" else tron_criteria(parse_filter(p.get("tron_filter") or ""))
+            except ValueError:
+                summary = "⚠️ Условия поиска не распознаны. Задайте их в настройках."
+            lines.append(html.escape(summary))
+            if ok is False:
+                lines.append("Количество аккаунтов сейчас неизвестно.")
+                error = st.get(name + "_last_error")
+                if error:
+                    lines.append(html.escape(user_error(error)))
+            elif st.get(count_key) is not None:
+                lines.append(f"Подходящих в последней проверке: <b>{st[count_key]}</b>")
+                lines.append(f"Новых в этой проверке: <b>{st.get(new_key, 0)}</b>")
+                if st[count_key] == 0:
+                    lines.append("По этим условиям ничего не найдено. Проверьте ограничение цены.")
+            checked_at = st.get(name + "_checked_at")
+            if checked_at:
+                lines.append("Проверено: " + _ago(checked_at))
+        lines.append("\nСтарые аккаунты учитываются в результатах. Уведомления приходят только о новых.")
+        keyboard = {"inline_keyboard": [
+            [{"text": "🔄 Обновить статус", "callback_data": "nav:status"}, {"text": "🔎 Проверить сейчас", "callback_data": "nav:check"}],
+            [{"text": "⚙️ Изменить условия", "callback_data": "nav:settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
+        ]}
+        self.show_page(p, chat_id, "\n".join(lines), keyboard, "status", message_id)
 
     def run_forever(self) -> None:
         while True:
@@ -2327,6 +2518,8 @@ def track_availability(bot: Bot, rt: UserRuntime, name: str, label: str, error: 
     st = rt.stats
     since_key, fails_key, oks_key = f"{name}_down_since", f"{name}_fails", f"{name}_oks"
     st[f"{name}_last_ok"] = not error
+    st[f"{name}_last_error"] = error
+    st[f"{name}_checked_at"] = time.time()
     if error:
         st[fails_key] = st.get(fails_key, 0) + 1
         st[oks_key] = 0

@@ -52,8 +52,31 @@ https://lzt.market/telegram/?country[]=UZ&min_contacts=100&spam=no&pmax=500
 - **systemd:** пример юнита в `lzt-monitor.service`.
 - **Docker:** `docker compose up -d --build` (состояние хранится в `./data`).
 
+## Что известно про API
+
+Сверено с документацией https://lzt-market.readme.io/reference/information и
+официальными клиентами Lolzteam:
+
+- Базовый адрес `https://prod-api.lzt.market`, авторизация заголовком
+  `Authorization: Bearer <token>`.
+- Список лотов: `GET /telegram` с теми же параметрами, что у сайта:
+  `country[]`, `min_contacts`, `spam`, `order_by`, `page`, `pmin`, `pmax`.
+- Ответ: `items` (лоты), `totalItems`, `perPage`, `hasNextPage`.
+  У лота есть `item_id`, `title`, `price`, `price_currency`, `published_date`,
+  `item_origin` и поля `telegram_*`.
+- Лимит для поиска по категориям: 120 запросов в минуту, при превышении
+  API отвечает `429`. Монитор делает один запрос за проверку, при `429`
+  ждёт `Retry-After`. Интервал 60 секунд с большим запасом.
+
+Чтобы увидеть, какие именно поля приходят по вашему фильтру:
+
+```bash
+python monitor.py --dump
+```
+
 ## Файлы
 
-- `monitor.py` — сам монитор (`--once` для одной проверки, `--test` для тестового сообщения).
+- `monitor.py` — сам монитор (`--once` для одной проверки, `--test` для тестового
+  сообщения, `--dump` чтобы напечатать сырой ответ API).
 - `get_chat_id.py` — показывает chat_id.
 - `state.json` — список уже отправленных лотов, создаётся автоматически.

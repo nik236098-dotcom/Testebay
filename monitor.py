@@ -171,6 +171,7 @@ class LztClient:
             data = resp.json()
             if isinstance(data, dict) and data.get("errors"):
                 raise RuntimeError(f"API вернул ошибку: {data['errors']}")
+            # Ответ: {"items": [...], "totalItems": N, "perPage": N, "hasNextPage": bool, ...}
             items = data.get("items", []) if isinstance(data, dict) else []
             return [i for i in items if isinstance(i, dict) and "item_id" in i]
 
@@ -212,6 +213,18 @@ class Telegram:
 
 # ---------- форматирование ----------
 
+# Поля, которые уже выводятся отдельными строками
+KNOWN_TELEGRAM_KEYS = {
+    "telegram_country", "telegram_contacts", "telegram_contacts_count",
+    "telegram_spam_block", "telegram_premium", "telegram_chats_count",
+    "telegram_channels_count", "telegram_conversations_count",
+}
+# Служебные и потенциально чувствительные поля, их в чат не шлём
+HIDDEN_KEYS = {
+    "telegram_client", "telegram_json", "telegram_api_id", "telegram_api_hash",
+    "telegram_phone", "telegram_password", "telegram_id", "telegram_username",
+}
+
 def _first(item: dict, *keys: str):
     for key in keys:
         value = item.get(key)
@@ -238,10 +251,10 @@ def _yes_no(value) -> str:
 def format_item(item: dict) -> str:
     item_id = item["item_id"]
     title = html.escape(str(_first(item, "title", "title_en") or f"Лот #{item_id}"))
-    price = _first(item, "price")
-    currency = _first(item, "currency") or "₽"
-    if currency == "rub":
-        currency = "₽"
+    # В ответе API: price + price_currency (например "rub"), дублируется в rub_price
+    price = _first(item, "price", "rub_price")
+    currency = str(_first(item, "price_currency", "currency") or "rub").lower()
+    currency = {"rub": "₽", "usd": "$", "eur": "€"}.get(currency, currency.upper())
     price_str = f"{price} {currency}" if price is not None else "?"
 
     lines = [f"🆕 <b>{title}</b>", f"💰 Цена: <b>{html.escape(price_str)}</b>"]
@@ -266,6 +279,16 @@ def format_item(item: dict) -> str:
         value = _first(item, *keys)
         if value is not None:
             lines.append(f"• {label}: {value}")
+    # Остальные telegram_* поля выводим как есть: точный набор полей в
+    # спецификации API не типизирован, так ничего не потеряется.
+    for key in sorted(item):
+        if not key.startswith("telegram_") or key in KNOWN_TELEGRAM_KEYS or key in HIDDEN_KEYS:
+            continue
+        value = item[key]
+        if value in (None, "", [], {}) or isinstance(value, (dict, list)):
+            continue
+        label = key[len("telegram_"):].replace("_", " ")
+        lines.append(f"• {html.escape(label)}: {html.escape(str(value))}")
     origin = _first(item, "item_origin")
     if origin:
         lines.append(f"📦 Происхождение: {html.escape(str(origin))}")
@@ -329,6 +352,14 @@ def main(argv: list[str]) -> int:
         return 0 if ok else 1
 
     lzt = LztClient(cfg.lzt_token)
+
+    if "--dump" in argv:
+        # Показать сырой ответ API: удобно, чтобы увидеть реальные названия полей
+        items = lzt.fetch_items(cfg.category, cfg.api_params())
+        print(json.dumps(items[:3], ensure_ascii=False, indent=2))
+        print(f"\nВсего лотов на первой странице: {len(items)}")
+        return 0
+
     state = State(cfg.state_file)
 
     log.info("Слежу за %s каждые %d с", cfg.site_url(), cfg.poll_interval)

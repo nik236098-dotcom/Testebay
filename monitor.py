@@ -279,6 +279,17 @@ class State:
 
 # ---------- клиенты сайтов ----------
 
+def _body_snippet(resp, limit: int = 120) -> str:
+    """Короткий текст ответа для сообщения об ошибке: у HTML-страниц (DDoS-Guard, заглушка
+    техработ) убираем теги, чтобы было видно, кто именно ответил."""
+    text = resp.text or ""
+    server = resp.headers.get("Server", "")
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = " ".join(text.split())
+    return (f"[{server}] " if server else "") + (text[:limit] or "пустой ответ")
+
+
 class LztClient:
     def __init__(self, token: str) -> None:
         self.session = requests.Session()
@@ -342,7 +353,7 @@ class LztClient:
             if resp.status_code >= 500:
                 # 5xx (чаще всего 503 на техработах) держится долго: одна повторная попытка,
                 # иначе проверка занимает замок минутами и /check не может вклиниться
-                self._err(f"lzt вернул {resp.status_code}")
+                self._err(f"lzt вернул {resp.status_code}: {_body_snippet(resp)}")
                 if last or attempt >= 2:
                     return []
                 time.sleep(backoff)

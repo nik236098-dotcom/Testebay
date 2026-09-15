@@ -306,6 +306,33 @@ class LztClient:
         log.error("Не удалось получить список лотов после нескольких попыток")
         return []
 
+    def fast_buy(self, item_id: int, price=None) -> tuple[bool, str]:
+        """POST /{item_id}/fast-buy: проверка аккаунта и покупка одним запросом.
+
+        Возвращает (успех, текст для пользователя). price передаём ту, что видели:
+        если продавец поднял цену, маркет откажет и деньги не спишет.
+        """
+        body = {}
+        if price is not None:
+            body["price"] = price
+        try:
+            resp = self.session.post(f"{API_BASE}/{item_id}/fast-buy", json=body, timeout=90)
+        except requests.RequestException as exc:
+            return False, f"Ошибка сети: {exc}"
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if errors:
+            return False, "; ".join(str(e) for e in errors)
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        item = data.get("item") if isinstance(data, dict) else None
+        if isinstance(item, dict) and item.get("item_state") not in (None, "paid", "sold"):
+            return False, f"Маркет вернул состояние лота: {item.get('item_state')}"
+        return True, "Покупка прошла. Данные аккаунта на странице лота."
+
 
 class WebClient:
     """Источник без API: разбор HTML-страницы каталога (см. web_source.py)."""
@@ -331,44 +358,67 @@ class Telegram:
         self.base = f"{TG_API}/bot{bot_token}"
         self.session = requests.Session()
 
-    def send(self, chat_id: int | str, text: str) -> bool:
+    def call(self, method: str, payload: dict) -> dict | None:
+        """Вызов метода Bot API с повторами. Возвращает result или None."""
+        for attempt in range(1, 4):
+            try:
+                resp = self.session.post(f"{self.base}/{method}", json=payload, timeout=30)
+            except requests.RequestException as exc:
+                log.warning("Telegram: ошибка сети (попытка %d): %s", attempt, exc)
+                time.sleep(3 * attempt)
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code == 429:
+                retry_after = data.get("parameters", {}).get("retry_after", 5)
+                log.warning("Telegram: лимит, жду %s с", retry_after)
+                time.sleep(int(retry_after))
+                continue
+            if resp.ok and data.get("ok"):
+                return data.get("result") or {}
+            log.error("Telegram %s: ответ %d: %s", method, resp.status_code, resp.text[:300])
+            return None
+        return None
+
+    def send(self, chat_id: int | str, text: str, reply_markup: dict | None = None) -> bool:
         payload = {
             "chat_id": chat_id,
             "text": text[:TELEGRAM_MESSAGE_LIMIT],
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        for attempt in range(1, 4):
-            try:
-                resp = self.session.post(f"{self.base}/sendMessage", json=payload, timeout=30)
-            except requests.RequestException as exc:
-                log.warning("Telegram: ошибка сети (попытка %d): %s", attempt, exc)
-                time.sleep(3 * attempt)
-                continue
-            if resp.status_code == 429:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-                log.warning("Telegram: лимит, жду %s с", retry_after)
-                time.sleep(int(retry_after))
-                continue
-            if resp.ok and resp.json().get("ok"):
-                return True
-            log.error("Telegram: ответ %d: %s", resp.status_code, resp.text[:300])
-            return False
-        return False
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.call("sendMessage", payload) is not None
 
-    def send_all(self, chat_ids: list[int], text: str) -> int:
+    def send_all(self, chat_ids: list[int], text: str, reply_markup: dict | None = None) -> int:
         """Отправить всем подписчикам. Возвращает число успешных отправок."""
         ok = 0
         for chat_id in list(chat_ids):
-            if self.send(chat_id, text):
+            if self.send(chat_id, text, reply_markup):
                 ok += 1
         return ok
+
+    def edit_markup(self, chat_id: int, message_id: int, reply_markup: dict | None) -> None:
+        self.call(
+            "editMessageReplyMarkup",
+            {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {"inline_keyboard": []}},
+        )
+
+    def answer_callback(self, callback_id: str, text: str = "", alert: bool = False) -> None:
+        self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200], "show_alert": alert})
 
     def get_updates(self, offset: int, timeout: int = 30) -> list[dict]:
         try:
             resp = self.session.get(
                 f"{self.base}/getUpdates",
-                params={"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'},
+                params={
+                    "offset": offset,
+                    "timeout": timeout,
+                    "allowed_updates": '["message","callback_query"]',
+                },
                 timeout=timeout + 10,
             )
             data = resp.json()
@@ -406,7 +456,83 @@ class Bot:
     def allowed(self, user_id: int) -> bool:
         return not self.cfg.tg_user_ids or user_id in self.cfg.tg_user_ids
 
+    # ---------- кнопки под лотом ----------
+
+    @staticmethod
+    def _price_label(price, currency) -> str:
+        cur = {"rub": "₽", "usd": "$", "eur": "€"}.get(str(currency or "rub").lower(), str(currency or ""))
+        return f"{price} {cur}".strip()
+
+    def item_keyboard(self, item: dict, stage: str = "buy") -> dict:
+        """stage: "buy" — кнопка Купить; "confirm" — Подтвердить/Отмена; "done" — только ссылка."""
+        item_id = int(item["item_id"])
+        price = item.get("price")
+        rows = []
+        can_buy = self.cfg.source == "api" and price is not None
+        if can_buy and stage == "buy":
+            rows.append([{"text": f"🛒 Купить за {self._price_label(price, item.get('price_currency'))}",
+                          "callback_data": f"buy:{item_id}:{price}"}])
+        elif can_buy and stage == "confirm":
+            rows.append([
+                {"text": f"✅ Подтвердить за {self._price_label(price, item.get('price_currency'))}",
+                 "callback_data": f"confirm:{item_id}:{price}"},
+                {"text": "❌ Отмена", "callback_data": f"cancel:{item_id}:{price}"},
+            ])
+        rows.append([{"text": "🔗 Открыть на сайте", "url": f"{MARKET_URL}/{item_id}/"}])
+        return {"inline_keyboard": rows}
+
+    def handle_callback(self, cq: dict) -> None:
+        cq_id = cq.get("id", "")
+        user_id = (cq.get("from") or {}).get("id")
+        msg = cq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        message_id = msg.get("message_id")
+        data = cq.get("data") or ""
+        parts = data.split(":")
+        if len(parts) != 3 or chat_id is None:
+            self.tg.answer_callback(cq_id)
+            return
+        action, item_id_s, price_s = parts
+        try:
+            item_id = int(item_id_s)
+            price = float(price_s)
+            price = int(price) if price.is_integer() else price
+        except ValueError:
+            self.tg.answer_callback(cq_id)
+            return
+        item = {"item_id": item_id, "price": price}
+
+        if not self.allowed(user_id):
+            self.tg.answer_callback(cq_id, "⛔ Доступ только владельцу", alert=True)
+            return
+        if self.cfg.source != "api" or not hasattr(self.lzt, "fast_buy"):
+            self.tg.answer_callback(cq_id, "Покупка доступна только в режиме SOURCE=api", alert=True)
+            return
+
+        if action == "buy":
+            self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "confirm"))
+            self.tg.answer_callback(cq_id, "Подтвердите покупку")
+        elif action == "cancel":
+            self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "buy"))
+            self.tg.answer_callback(cq_id, "Отменено")
+        elif action == "confirm":
+            self.tg.answer_callback(cq_id, "Покупаю…")
+            self.tg.edit_markup(chat_id, message_id, self.item_keyboard(item, "done"))
+            ok, text = self.lzt.fast_buy(item_id, price)
+            log.info("Покупка лота %d за %s пользователем %s: %s — %s", item_id, price, user_id, ok, text)
+            if ok:
+                self.tg.send(chat_id, f"✅ Куплен лот {item_id} за {self._price_label(price, None)}.\n"
+                                      f"{html.escape(text)}\n{MARKET_URL}/{item_id}/")
+            else:
+                self.tg.send(chat_id, f"❌ Не удалось купить лот {item_id}: {html.escape(text)}\n{MARKET_URL}/{item_id}/",
+                             self.item_keyboard(item, "buy"))
+        else:
+            self.tg.answer_callback(cq_id)
+
     def handle(self, update: dict) -> None:
+        if update.get("callback_query"):
+            self.handle_callback(update["callback_query"])
+            return
         msg = update.get("message") or {}
         chat = msg.get("chat") or {}
         user = msg.get("from") or {}
@@ -475,7 +601,7 @@ class Bot:
             latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
             self.tg.send(chat_id, f"Найдено лотов на первой странице: {len(items)}. Последние:")
             for item in latest:
-                self.tg.send(chat_id, format_item(item))
+                self.tg.send(chat_id, format_item(item), self.item_keyboard(item))
         elif command == "/status":
             with self.state.lock:
                 subs = len(self.state.subscribers)
@@ -617,7 +743,7 @@ def format_item(item: dict) -> str:
 
 # ---------- основной цикл ----------
 
-def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Telegram) -> int:
+def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Telegram, bot: "Bot | None" = None) -> int:
     items = lzt.fetch_items(cfg.category, cfg.api_params())
     STATS["checks"] += 1
     STATS["last_check_at"] = time.time()
@@ -659,7 +785,8 @@ def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Tele
     sent = 0
     for item in new_items:
         item_id = int(item["item_id"])
-        if tg.send_all(subscribers, format_item(item)):
+        keyboard = bot.item_keyboard(item) if bot else None
+        if tg.send_all(subscribers, format_item(item), keyboard):
             sent += 1
             log.info("Отправлен лот %d (%s)", item_id, item.get("price"))
         else:
@@ -726,7 +853,7 @@ def main(argv: list[str]) -> int:
     once = "--once" in argv
     while True:
         try:
-            check_once(cfg, state, lzt, tg)
+            check_once(cfg, state, lzt, tg, bot)
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - монитор не должен падать из-за одной ошибки

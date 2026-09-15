@@ -1373,6 +1373,7 @@ class Bot:
         "/tron on|off, /tronfilter … — tronaccs вручную\n"
         "/tronid UZ — узнать ID страны на tronaccs\n"
         "/lztdump, /trondump — лот в сыром виде, как отдаёт сайт\n"
+        "/lot <номер или ссылка> — почему бот не показывает конкретный лот lzt\n"
         "/stop — отписать этот чат, /start — подписать снова\n"
         "/id — ваш Telegram ID"
     )
@@ -2396,6 +2397,8 @@ class Bot:
             self.run_in_background(user_id, command, chat_id, self.cmd_tronid, p, rt, chat_id, arg)
         elif command == "/lztdump":
             self.run_in_background(user_id, command, chat_id, self.cmd_lztdump, p, rt, chat_id)
+        elif command == "/lot":
+            self.run_in_background(user_id, command, chat_id, self.cmd_lot, p, rt, chat_id, arg)
         elif command == "/trondump":
             self.run_in_background(user_id, command, chat_id, self.cmd_trondump, p, rt, chat_id)
         elif command == "/invite" and self.is_owner(user_id):
@@ -2828,6 +2831,67 @@ class Bot:
         # Сами лоты — обычными сообщениями в чат, как при плановой проверке: с полным описанием и кнопками
         for item in to_send:
             self.tg.send(chat_id, format_item(item), self.item_keyboard(rt, item))
+
+    def cmd_lot(self, p: dict, rt: UserRuntime | None, chat_id: int, arg: str) -> None:
+        """Диагностика одного лота lzt: видит ли его API вообще, попадает ли он под фильтр,
+        и не лежит ли он уже в памяти бота как показанный."""
+        m = re.search(r"(\d{3,})", arg or "")
+        if not m:
+            self.tg.send(chat_id, "Укажите номер лота или ссылку: <code>/lot 259639880</code>")
+            return
+        item_id = int(m.group(1))
+        if not rt or not isinstance(rt.lzt, LztClient):
+            self.tg.send(chat_id, "Для этой проверки нужен токен API lzt.market (/token lzt).")
+            return
+        lines = [f"🔍 <b>Лот {item_id}</b>", f"🔗 {MARKET_URL}/{item_id}/"]
+        in_seen = item_id in p["seen"]["lzt"]
+        ab = p.get("autobuy") or {}
+        in_ab_seen = item_id in ((ab.get("seen") or {}).get("lzt") or []) if isinstance(ab.get("seen"), dict) else False
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            detail = rt.lzt.account_data(item_id)
+            rt.lzt.last_error = None
+            by_filter = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
+            err_filter, cached = rt.lzt.last_error, rt.lzt.last_meta.get("wasCached")
+            rt.lzt.last_error = None
+            no_filter = rt.lzt.fetch_items(p["category"], [("order_by", "pdate_to_down")], retries=1)
+            err_all = rt.lzt.last_error
+        finally:
+            rt.lock.release()
+        in_filter = any(int(i.get("item_id") or 0) == item_id for i in by_filter)
+        in_all = any(int(i.get("item_id") or 0) == item_id for i in no_filter)
+        if isinstance(detail, dict) and detail.get("item_id"):
+            lines.append("\n<b>Как его видит API:</b>")
+            lines.append(format_item(detail))
+            raw = {k: detail.get(k) for k in ("item_state", "telegram_country", "telegram_contacts", "telegram_contacts_count",
+                                              "telegram_spam_block", "price", "published_date", "category_id") if k in detail}
+            lines.append("<code>" + html.escape(json.dumps(raw, ensure_ascii=False)) + "</code>")
+        else:
+            lines.append("\n⚠️ API не отдаёт данные этого лота (нет такого номера, лот скрыт или ещё не появился в API).")
+        lines.append("\n<b>Где он есть:</b>")
+        lines.append(("✅" if in_filter else "❌") + " в выдаче по вашему фильтру"
+                     + (f" (ошибка: {html.escape(user_error(err_filter))})" if err_filter else "")
+                     + (" — ответ из кэша" if cached else ""))
+        lines.append(("✅" if in_all else "❌") + " в общей выдаче категории без фильтра, первая страница"
+                     + (f" (ошибка: {html.escape(user_error(err_all))})" if err_all else ""))
+        lines.append(("✅" if in_seen else "❌") + " в памяти бота как уже показанный")
+        if ab.get("enabled"):
+            lines.append(("✅" if in_ab_seen else "❌") + " в памяти AutoBuy как уже обработанный")
+        lines.append("\n<b>Вывод:</b>")
+        if in_filter and in_seen:
+            lines.append("Бот его видит, но уже показывал раньше, поэтому молчит. Новые лоты присылаются один раз.")
+        elif in_filter:
+            lines.append("Бот его видит и ещё не показывал: придёт на ближайшей плановой проверке.")
+        elif in_all:
+            lines.append("API отдаёт лот, но ваш фильтр его отсекает. Сравните поля выше с условиями в /settings: "
+                         "страна, контакты, спамблок, цена. Спамблок «неизвестно» под «без спамблока» не подходит.")
+        elif isinstance(detail, dict) and detail.get("item_id"):
+            lines.append("Лот в API есть, но в списках его ещё нет: у lzt список обновляется с задержкой, "
+                         "либо лот на проверке (см. item_state). Обычно появляется через несколько минут.")
+        else:
+            lines.append("API этого лота не знает. Проверьте номер; если на сайте он есть, у API отставание.")
+        self.tg.send(chat_id, "\n".join(lines))
 
     def cmd_lztdump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
         if not rt or rt.lzt is None:

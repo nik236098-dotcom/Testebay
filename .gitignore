@@ -4,3 +4,4 @@ state.json.tmp
 __pycache__/
 *.pyc
 .venv/
+.browser-profile/

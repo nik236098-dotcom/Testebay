@@ -7,7 +7,11 @@
     https://lzt.market/telegram/?country[]=UZ&min_contacts=100&spam=no
 
 Настройка через переменные окружения (см. .env.example):
-    LZT_TOKEN        - токен API Lolzteam (https://lolz.live/account/api)
+    SOURCE           - "web" (страница сайта, без платного API, по умолчанию)
+                       или "api" (официальный API, нужен LZT_TOKEN)
+    LZT_COOKIES      - (web) строка Cookie из браузера, если сайт блокирует запросы
+    USE_BROWSER      - (web) "1" чтобы грузить страницу через Playwright/Chromium
+    LZT_TOKEN        - (api) токен API Lolzteam (https://lolz.live/account/api)
     TG_BOT_TOKEN     - токен Telegram-бота от @BotFather
     TG_CHAT_ID       - id чата, куда слать уведомления (python get_chat_id.py)
     LZT_CATEGORY     - категория, по умолчанию "telegram"
@@ -32,6 +36,8 @@ from urllib.parse import parse_qsl, urlencode
 
 import requests
 
+from web_source import WebSourceError, fetch_items_web
+
 try:  # .env необязателен, но удобен для локального запуска
     from dotenv import load_dotenv
 
@@ -53,6 +59,9 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 class Config:
     def __init__(self) -> None:
         self.lzt_token = os.getenv("LZT_TOKEN", "").strip()
+        self.source = os.getenv("SOURCE", "api" if self.lzt_token else "web").strip().lower()
+        self.cookies = os.getenv("LZT_COOKIES", "").strip() or None
+        self.use_browser = os.getenv("USE_BROWSER", "0") == "1"
         self.tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
         self.tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
         self.category = os.getenv("LZT_CATEGORY", "telegram").strip().strip("/")
@@ -62,15 +71,12 @@ class Config:
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
-        missing = [
-            name
-            for name, value in (
-                ("LZT_TOKEN", self.lzt_token),
-                ("TG_BOT_TOKEN", self.tg_bot_token),
-                ("TG_CHAT_ID", self.tg_chat_id),
-            )
-            if not value
-        ]
+        if self.source not in ("api", "web"):
+            raise SystemExit("SOURCE должен быть 'web' или 'api'")
+        required = [("TG_BOT_TOKEN", self.tg_bot_token), ("TG_CHAT_ID", self.tg_chat_id)]
+        if self.source == "api":
+            required.append(("LZT_TOKEN", self.lzt_token))
+        missing = [name for name, value in required if not value]
         if missing:
             raise SystemExit(
                 "Не заданы переменные окружения: "
@@ -89,6 +95,10 @@ class Config:
                   if k not in ("order_by", "page")]
         params.append(("order_by", "pdate_to_down"))
         return params
+
+    def web_query(self) -> str:
+        """Та же строка фильтров для страницы сайта, с сортировкой по дате."""
+        return urlencode(self.api_params())
 
     def site_url(self) -> str:
         return f"{MARKET_URL}/{self.category}/?{self.query}"
@@ -177,6 +187,24 @@ class LztClient:
 
         log.error("Не удалось получить список лотов после нескольких попыток")
         return []
+
+
+class WebClient:
+    """Источник без API: разбор HTML-страницы каталога (см. web_source.py)."""
+
+    def __init__(self, cookies: str | None, use_browser: bool) -> None:
+        self.cookies = cookies
+        self.use_browser = use_browser
+        self.session = requests.Session()
+
+    def fetch_items(self, category: str, params: list[tuple[str, str]]) -> list[dict]:
+        try:
+            return fetch_items_web(
+                category, urlencode(params), self.cookies, self.use_browser, self.session
+            )
+        except (WebSourceError, requests.RequestException) as exc:
+            log.error("Не удалось загрузить страницу: %s", exc)
+            return []
 
 
 class Telegram:
@@ -289,6 +317,9 @@ def format_item(item: dict) -> str:
             continue
         label = key[len("telegram_"):].replace("_", " ")
         lines.append(f"• {html.escape(label)}: {html.escape(str(value))}")
+    details = _first(item, "web_details")
+    if details:
+        lines.append(f"ℹ️ {html.escape(str(details))}")
     origin = _first(item, "item_origin")
     if origin:
         lines.append(f"📦 Происхождение: {html.escape(str(origin))}")
@@ -302,7 +333,7 @@ def format_item(item: dict) -> str:
 
 # ---------- основной цикл ----------
 
-def check_once(cfg: Config, state: State, lzt: LztClient, tg: Telegram) -> int:
+def check_once(cfg: Config, state: State, lzt: "LztClient | WebClient", tg: Telegram) -> int:
     items = lzt.fetch_items(cfg.category, cfg.api_params())
     if not items:
         return 0
@@ -351,7 +382,10 @@ def main(argv: list[str]) -> int:
         print("Тестовое сообщение отправлено" if ok else "Не удалось отправить тестовое сообщение")
         return 0 if ok else 1
 
-    lzt = LztClient(cfg.lzt_token)
+    if cfg.source == "api":
+        lzt = LztClient(cfg.lzt_token)
+    else:
+        lzt = WebClient(cfg.cookies, cfg.use_browser)
 
     if "--dump" in argv:
         # Показать сырой ответ API: удобно, чтобы увидеть реальные названия полей
@@ -362,7 +396,9 @@ def main(argv: list[str]) -> int:
 
     state = State(cfg.state_file)
 
-    log.info("Слежу за %s каждые %d с", cfg.site_url(), cfg.poll_interval)
+    log.info(
+        "Слежу за %s каждые %d с (источник: %s)", cfg.site_url(), cfg.poll_interval, cfg.source
+    )
     once = "--once" in argv
     while True:
         try:

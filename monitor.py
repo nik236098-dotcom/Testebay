@@ -1187,7 +1187,7 @@ class Bot:
                     log.exception("Ошибка в команде %s пользователя %s", name, user_id)
                     self.tg.send(chat_id, f"⚠️ Команда {name} завершилась с ошибкой, подробности в логе.")
 
-            job = threading.Thread(target=runner, name=f"cmd-{name.lstrip('/')}-{user_id}", daemon=True)
+            job = threading.Thread(target=runner, name=f"cmd-{name.lstrip('/').replace(' ', '_')}-{user_id}", daemon=True)
             self.jobs[key] = job
             job.start()
 
@@ -1502,19 +1502,26 @@ class Bot:
         elif action in ("buy", "confirm"):
             self.tg.answer_callback(cq_id, "Покупаю…")
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(rt, item, "done"))
-            client = rt.tron if is_tron else rt.lzt
-            ok, text = client.buy(item_id) if is_tron else client.fast_buy(item_id, price)
-            site = "tronaccs" if is_tron else "lzt.market"
-            log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, user_id, ok, text)
-            if ok:
-                self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
-                                      f"{html.escape(text)}\n{item_url}")
-                self.send_account_files(rt, chat_id, item_id, site)
-            else:
-                self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(text)}\n{item_url}",
-                             self.item_keyboard(rt, item, "buy"))
+            # Покупка и выгрузка файлов сессии ходят к маркету и Telegram, это долго: в фон.
+            # Ключ по лоту: повторное нажатие той же кнопки не купит лот дважды.
+            self.run_in_background(user_id, f"покупка лота {item_id}", chat_id,
+                                   self.do_buy, rt, chat_id, item, is_tron, item_url)
         else:
             self.tg.answer_callback(cq_id)
+
+    def do_buy(self, rt: UserRuntime, chat_id: int, item: dict, is_tron: bool, item_url: str) -> None:
+        item_id, price = item["item_id"], item["price"]
+        client = rt.tron if is_tron else rt.lzt
+        ok, text = client.buy(item_id) if is_tron else client.fast_buy(item_id, price)
+        site = "tronaccs" if is_tron else "lzt.market"
+        log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, rt.profile["user_id"], ok, text)
+        if ok:
+            self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
+                                  f"{html.escape(text)}\n{item_url}")
+            self.send_account_files(rt, chat_id, item_id, site)
+        else:
+            self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(text)}\n{item_url}",
+                         self.item_keyboard(rt, item, "buy"))
 
     def send_account_files(self, rt: UserRuntime, chat_id: int, item_id: int, site: str) -> None:
         """После покупки выгружает данные аккаунта (сессия, tdata и т.п.) файлами."""

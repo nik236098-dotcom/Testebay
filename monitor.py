@@ -661,6 +661,49 @@ def _maybe_binary(value: str) -> bytes | None:
     return None
 
 
+# Боевые дата-центры Telegram: dc_id -> адрес (порт 443)
+TG_DC = {1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100",
+         4: "149.154.167.91", 5: "91.108.56.130"}
+
+
+def _decode_auth_key(value: str) -> bytes | None:
+    """auth_key приходит hex (512 симв.) или base64 (256 байт)."""
+    s = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{512}", s):
+        try:
+            return bytes.fromhex(s)
+        except ValueError:
+            return None
+    if _B64_RE.match(s):
+        try:
+            raw = base64.b64decode(s + "=" * (-len(s) % 4), validate=False)
+            if len(raw) == 256:
+                return raw
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def session_from_authkey(flat: dict) -> bytes | None:
+    """Собрать .session из отдельных полей auth_key + dc_id (формат tronaccs)."""
+    auth_key = dc_id = None
+    for key, value in flat.items():
+        low = key.lower().rsplit(".", 1)[-1]
+        if auth_key is None and isinstance(value, str) and ("auth" in low and "key" in low or low in ("authkey", "auth_key")):
+            auth_key = _decode_auth_key(value)
+        if dc_id is None and ("dc" in low and ("id" in low or low == "dc") or low in ("dcid", "dc_id")):
+            try:
+                n = int(value)
+                if 1 <= n <= 5:
+                    dc_id = n
+            except (TypeError, ValueError):
+                pass
+    if not auth_key:
+        return None
+    dc_id = dc_id or 2
+    return _make_telethon_session(dc_id, TG_DC.get(dc_id, TG_DC[2]), 443, auth_key)
+
+
 def _parse_telethon_string(session_str: str):
     """Строковая сессия Telethon -> (dc_id, ip, port, auth_key). Без зависимостей."""
     import socket
@@ -832,7 +875,14 @@ def build_account_files(item_id: int, data, downloader=None) -> tuple[list[tuple
                 add(f"{item_id}_{label}.{ext}", value.encode("utf-8"))
                 break
 
-    # Полный ответ прикладываем как запасной, если готового .session не нашлось
+    # Не нашли готовый .session? Пробуем собрать из auth_key + dc_id (формат tronaccs)
+    if not got_session:
+        built = session_from_authkey(flat)
+        if built:
+            add(f"{item_id}.session", built)
+            got_session = True
+
+    # Полный ответ прикладываем как запасной, если .session так и не собрался
     if not got_session:
         add(f"{item_id}.json", json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 

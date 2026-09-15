@@ -345,13 +345,15 @@ class Bot:
         "/status — что мониторится и сколько лотов запомнено\n"
         "/filter <ссылка> — сменить фильтр: пришлите адрес страницы lzt.market с нужными фильтрами\n"
         "/filter — показать текущий фильтр\n"
+        "/check — проверить прямо сейчас и показать последние лоты по фильтру\n"
         "/id — показать ваш Telegram ID"
     )
 
-    def __init__(self, cfg: Config, state: State, tg: Telegram) -> None:
+    def __init__(self, cfg: Config, state: State, tg: Telegram, lzt=None) -> None:
         self.cfg = cfg
         self.state = state
         self.tg = tg
+        self.lzt = lzt
 
     def allowed(self, user_id: int) -> bool:
         return not self.cfg.tg_user_ids or user_id in self.cfg.tg_user_ids
@@ -413,6 +415,19 @@ class Bot:
                 "✅ Фильтр обновлён:\n" + html.escape(self.cfg.site_url())
                 + "\n\nТекущие лоты по нему запомню молча, дальше буду присылать только новые.",
             )
+        elif command == "/check":
+            if self.lzt is None:
+                self.tg.send(chat_id, "Источник лотов не подключён.")
+                return
+            self.tg.send(chat_id, "🔎 Проверяю…")
+            items = self.lzt.fetch_items(self.cfg.category, self.cfg.api_params())
+            if not items:
+                self.tg.send(chat_id, "По фильтру ничего не найдено или сайт не ответил. Подробности в логах.")
+                return
+            latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
+            self.tg.send(chat_id, f"Найдено лотов на первой странице: {len(items)}. Последние:")
+            for item in latest:
+                self.tg.send(chat_id, format_item(item))
         elif command == "/status":
             with self.state.lock:
                 subs = len(self.state.subscribers)
@@ -621,7 +636,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     # Бот принимает /start и /stop в отдельном потоке, монитор крутится в основном
-    bot = Bot(cfg, state, tg)
+    bot = Bot(cfg, state, tg, lzt)
     threading.Thread(target=bot.run_forever, name="telegram-bot", daemon=True).start()
 
     log.info(
@@ -630,6 +645,12 @@ def main(argv: list[str]) -> int:
     )
     if not state.subscribers:
         log.info("Напишите боту /start в Telegram, чтобы получать уведомления")
+    elif os.getenv("NOTIFY_ON_STARTUP", "1") == "1":
+        tg.send_all(
+            list(state.subscribers),
+            "🟢 Монитор запущен. Слежу за:\n" + html.escape(cfg.site_url())
+            + "\n\nПришлю сообщение, как только появится новый лот. Проверить сейчас: /check",
+        )
     once = "--once" in argv
     while True:
         try:

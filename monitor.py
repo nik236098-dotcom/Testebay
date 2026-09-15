@@ -1879,7 +1879,22 @@ class Bot:
         if not text.startswith("/"):
             pending = self.awaiting.get(chat_id)
             if pending and pending[0] == user_id and p is not None:
-                self.handle_awaiting(p, chat_id, pending[1], text, message_id)
+                kind = pending[1]
+                valid = bool(text)
+                if kind == "country":
+                    valid = bool(re.fullmatch(r"[A-Za-z]{2}", text))
+                elif kind in ("contacts", "price_min", "price_max"):
+                    digits = text.replace(" ", "") if kind != "contacts" else text
+                    valid = bool(re.fullmatch(r"[0-9]+", digits))
+                elif kind == "panel_url":
+                    valid = text.startswith(("http://", "https://"))
+                else:
+                    # An isolated symbol is navigation, not an opaque access key.
+                    valid = len(text) > 1 and any(c.isalnum() for c in text)
+                if valid:
+                    self.handle_awaiting(p, chat_id, kind, text, message_id)
+                else:
+                    self.show_menu(p, chat_id)
             elif p is not None:
                 self.show_menu(p, chat_id)
             return
@@ -1887,6 +1902,15 @@ class Bot:
         parts = text.split(maxsplit=1)
         command = parts[0].split("@")[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+
+        # Always allow a registered user to leave an unfinished input flow.
+        # Opening the menu must not wait for marketplace client initialization.
+        if p is not None and command in ("/start", "/menu"):
+            if command == "/start" and chat_id not in p["chats"]:
+                p["chats"].append(chat_id)
+                self.state.save()
+            self.show_menu(p, chat_id)
+            return
 
         if command == "/id":
             self.tg.send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>\nID этого чата: <code>{chat_id}</code>")

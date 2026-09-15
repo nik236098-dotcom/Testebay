@@ -2363,8 +2363,6 @@ class Bot:
                 ab = p2.get("autobuy") or {}
                 ab_mark = (" 🤖🟢" if ab.get("enabled") else "")
                 lines.append(f"• {html.escape(p2['name'])} — ID <code>{p2['user_id']}</code>, чатов: {len(p2['chats'])}, "
-                             f"lzt: {'✅' if p2.get('lzt_token') else '—'}, tronaccs: {'✅
-                lines.append(f"• {html.escape(p2['name'])} — ID <code>{p2['user_id']}</code>, чатов: {len(p2['chats'])}, "
                              f"lzt: {'✅' if p2.get('lzt_token') else '—'}, tronaccs: {'✅' if p2.get('tron_token') else '—'}"
                              + (" 👑" if self.is_owner(p2['user_id']) else ""))
             lines.append(f"\nАктивных кодов: {len(self.state.invites)}")

@@ -256,19 +256,36 @@ class TronApiClient:
             "User-Agent": "lzt-market-monitor/1.0",
         })
 
+    MIN_INTERVAL = 1.1  # сервер требует не чаще одного запроса в секунду
+    _last_request_at = 0.0
+
     def _request(self, method: str, path: str, **kw):
-        resp = self.session.request(method, f"{TRON_API}{path}", timeout=kw.pop("timeout", 30), **kw)
-        if resp.status_code == 401:
-            raise TronError("tronaccs: 401, проверьте TRON_TOKEN")
-        if resp.status_code == 429:
-            raise TronError("tronaccs: превышен лимит запросов (429)")
-        try:
-            data = resp.json()
-        except ValueError:
-            raise TronError(f"tronaccs: HTTP {resp.status_code}, ответ не JSON: {resp.text[:200]}")
-        if resp.status_code >= 400:
-            raise TronError(f"tronaccs: HTTP {resp.status_code}: {str(data)[:200]}")
-        return data
+        timeout = kw.pop("timeout", 30)
+        for attempt in range(1, 6):
+            # Держим паузу между любыми запросами к tronaccs
+            wait = self._last_request_at + self.MIN_INTERVAL - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            resp = self.session.request(method, f"{TRON_API}{path}", timeout=timeout, **kw)
+            self._last_request_at = time.time()
+            if resp.status_code == 401:
+                raise TronError("tronaccs: 401, проверьте TRON_TOKEN")
+            try:
+                data = resp.json()
+            except ValueError:
+                raise TronError(f"tronaccs: HTTP {resp.status_code}, ответ не JSON: {resp.text[:200]}")
+            message = str((data.get("message") if isinstance(data, dict) else "") or "")
+            limited = resp.status_code == 429 or "Попробуйте через" in message or "Превышено количество" in message
+            if limited and attempt < 5:
+                m = re.search(r"через\s+(\d+)", message)
+                delay = int(m.group(1)) if m else 2
+                log.warning("tronaccs: лимит запросов, жду %d с (попытка %d)", delay, attempt)
+                time.sleep(delay + 0.3)
+                continue
+            if resp.status_code >= 400:
+                raise TronError(f"tronaccs: HTTP {resp.status_code}: {str(data)[:200]}")
+            return data
+        raise TronError("tronaccs: лимит запросов не снимается, попробуйте позже")
 
     def me(self) -> dict:
         """GET /me: баланс и валюта."""
@@ -299,7 +316,6 @@ class TronApiClient:
             page_size = page_size or len(raw_list)
             if len(raw_list) < page_size:
                 break
-            time.sleep(0.3)
         return list(items.values())
 
     def buy(self, item_id: int) -> tuple[bool, str]:

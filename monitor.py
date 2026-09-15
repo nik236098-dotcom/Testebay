@@ -452,7 +452,6 @@ class TronClient:
                     return cid
             if progress and cid % 50 == 0:
                 progress(cid)
-            time.sleep(0.25)
         return None
 
     def fetch_items(self) -> list[dict]:
@@ -1041,7 +1040,9 @@ class Bot:
             if code in self.state.country_ids:
                 self.tg.send(chat_id, f"{code} = ID {self.state.country_ids[code]} (уже известен). Искать заново: сначала /tronid reset")
                 return
-            self.tg.send(chat_id, f"🔎 Ищу ID страны {code} перебором через API tronaccs, это займёт до пары минут…")
+            self.tg.send(chat_id, f"🔎 Ищу ID страны {code} перебором через API tronaccs. "
+                                  "Сервер разрешает один запрос в секунду, так что это займёт до 5 минут. "
+                                  "Монитор tronaccs в это время на паузе.")
             try:
                 cid = self.tron.find_country_id(code, progress=lambda n: self.tg.send(chat_id, f"…проверил {n} ID"))
             except (TronError, requests.RequestException) as exc:

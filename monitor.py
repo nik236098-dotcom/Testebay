@@ -101,6 +101,10 @@ class Config:
         self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"
         self.send_session_files = os.getenv("SEND_SESSION_FILES", "1") == "1"
         self.session_only = os.getenv("SESSION_ONLY", "1") == "1"  # присылать только .session, без JSON и сводки
+        # Внешняя панель для автозагрузки .session (evangelion-best.to и т.п.)
+        self.panel_url = os.getenv("PANEL_URL", "").strip()
+        self.panel_token = os.getenv("PANEL_TOKEN", "").strip()
+        self.panel_field = os.getenv("PANEL_FIELD", "file").strip() or "file"
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -154,6 +158,10 @@ def new_profile(user_id: int, name: str, chat_id: int | None, cfg: Config, with_
         "settings": {},
         "seen": {"lzt": [], "tron": []},
         "init": {"lzt": False, "tron": False},
+        # Автозагрузка купленной .session во внешнюю панель (evangelion и т.п.)
+        "upload_url": cfg.panel_url if with_env_tokens else "",
+        "upload_token": cfg.panel_token if with_env_tokens else "",
+        "upload_field": cfg.panel_field,
     }
 
 
@@ -702,6 +710,34 @@ def _make_telethon_session(dc_id: int, ip: str, port: int, auth_key: bytes) -> b
         return None
 
 
+def upload_session(url: str, token: str, field: str, filename: str, content: bytes) -> tuple[bool, str]:
+    """POST .session во внешнюю панель. Токен идёт и заголовком, и полем, чтобы подойти под разные панели."""
+    headers = {}
+    dataf: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-Api-Key"] = token
+        dataf["token"] = token
+        dataf["api_key"] = token
+    try:
+        resp = requests.post(url, headers=headers, data=dataf,
+                             files={field or "file": (filename, content)}, timeout=120)
+    except requests.RequestException as exc:
+        return False, f"сеть: {exc}"
+    body = resp.text[:200]
+    try:
+        j = resp.json()
+        if isinstance(j, dict):
+            body = str(j.get("message") or j.get("error") or j.get("result") or j)[:200]
+            if resp.ok and str(j.get("status", "ok")).lower() in ("ok", "true", "success", "1") and not j.get("error"):
+                return True, body
+    except ValueError:
+        pass
+    if resp.ok:
+        return True, body or "загружено"
+    return False, f"HTTP {resp.status_code}: {body}"
+
+
 def stringsession_to_session(session_str: str) -> bytes | None:
     """Строковую сессию Telethon -> настоящий .session (SQLite), без внешних библиотек."""
     parsed = _parse_telethon_string(session_str)
@@ -944,6 +980,7 @@ class Bot:
         "/check — проверить прямо сейчас и показать последние лоты\n"
         "/status — что мониторится, балансы, последняя проверка\n"
         "/token — показать или сменить токены API\n"
+        "/panel — автозагрузка купленной сессии во внешнюю панель\n"
         "/filter <ссылка> — фильтр lzt.market ссылкой с сайта\n"
         "/tron on|off, /tronfilter … — tronaccs вручную\n"
         "/tronid UZ — узнать ID страны на tronaccs\n"
@@ -1331,6 +1368,15 @@ class Bot:
         elif not sessions:
             self.tg.send(chat_id, "📎 Готовый .session собрать не удалось. Данные во вложенном JSON или на странице лота. "
                                   "Если нужен именно .session, пришлите структуру ответа (названия полей).")
+        # Автозагрузка .session во внешнюю панель
+        prof = rt.profile
+        url = prof.get("upload_url")
+        if url and sessions:
+            for name, content in sessions:
+                ok2, info = upload_session(url, prof.get("upload_token") or "", prof.get("upload_field") or "file", name, content)
+                log.info("panel upload %s: %s — %s", name, ok2, info)
+                self.tg.send(chat_id, (f"⬆️ Панель: {name} загружен. {html.escape(info)}" if ok2
+                                       else f"⚠️ Панель: {name} не загрузился. {html.escape(info)}"))
 
     # --- регистрация и токены ---
 
@@ -1460,6 +1506,8 @@ class Bot:
             self.tg.send(chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""))
         elif command == "/token":
             self.cmd_token(p, chat_id, arg, message_id)
+        elif command == "/panel":
+            self.cmd_panel(p, chat_id, arg, message_id)
         elif command == "/filter":
             self.cmd_filter(p, chat_id, arg)
         elif command == "/check":
@@ -1534,6 +1582,21 @@ class Bot:
         if kind in ("lzt_token", "tron_token"):
             self.receive_token(p, chat_id, kind, text, message_id)
             return
+        if kind in ("panel_url", "panel_token"):
+            value = text.strip()
+            if kind == "panel_url":
+                if not value.startswith(("http://", "https://")):
+                    self.tg.send(chat_id, "Нужен адрес, начинающийся с http. Или /panel для отмены.")
+                    return
+                p["upload_url"] = value
+                msg = "✅ Адрес панели сохранён."
+            else:
+                p["upload_token"] = value
+                msg = "✅ Токен панели сохранён."
+            self.awaiting.pop(chat_id, None)
+            self.state.save()
+            self.tg.send(chat_id, msg + " Текущие настройки: /panel")
+            return
         s = self.current_settings(p)
         if kind == "country":
             code = text.strip().upper()
@@ -1555,6 +1618,56 @@ class Bot:
         self.awaiting.pop(chat_id, None)
         self.state.save()
         self.show_settings(p, chat_id)
+
+    def cmd_panel(self, p: dict, chat_id: int, arg: str, message_id: int | None) -> None:
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower() if parts is not None and len(parts) > 0 and parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            url = p.get("upload_url") or "не задан"
+            self.tg.send(chat_id,
+                         "⬆️ Автозагрузка .session во внешнюю панель\n"
+                         f"Адрес: <code>{html.escape(url)}</code>\n"
+                         f"Токен: <code>{html.escape(_mask(p.get('upload_token')))}</code>\n"
+                         f"Поле файла: <code>{html.escape(p.get('upload_field') or 'file')}</code>\n\n"
+                         "Настроить:\n"
+                         "/panel url &lt;адрес&gt; — куда слать файл\n"
+                         "/panel token &lt;токен&gt; — ключ доступа панели\n"
+                         "/panel field &lt;имя&gt; — имя поля с файлом (по умолчанию file)\n"
+                         "/panel off — выключить\n\n"
+                         "Точный адрес и поле возьмите из панели: F12 → Network, загрузите там сессию вручную, "
+                         "правой кнопкой по запросу → Copy → Copy as cURL, и пришлите мне.")
+            return
+        if sub == "off":
+            p["upload_url"] = ""
+            self.state.save()
+            self.tg.send(chat_id, "🔕 Автозагрузка в панель выключена.")
+        elif sub == "url" and rest:
+            if not rest.startswith(("http://", "https://")):
+                self.tg.send(chat_id, "Адрес должен начинаться с http.")
+                return
+            p["upload_url"] = rest
+            self.state.save()
+            self.tg.send(chat_id, "✅ Адрес панели сохранён. Проверить: /panel")
+        elif sub == "url":
+            self.awaiting[chat_id] = (p["user_id"], "panel_url")
+            self.tg.send(chat_id, "Пришлите адрес загрузки (URL) панели одним сообщением.")
+        elif sub == "token":
+            if rest:
+                if message_id:
+                    self.tg.delete(chat_id, message_id)
+                p["upload_token"] = rest
+                self.state.save()
+                self.tg.send(chat_id, "✅ Токен панели сохранён.")
+            else:
+                self.awaiting[chat_id] = (p["user_id"], "panel_token")
+                self.tg.send(chat_id, "Пришлите токен панели одним сообщением.")
+        elif sub == "field" and rest:
+            p["upload_field"] = rest
+            self.state.save()
+            self.tg.send(chat_id, f"✅ Поле файла: {html.escape(rest)}")
+        else:
+            self.tg.send(chat_id, "Не понял. /panel — показать настройки и подсказку.")
 
     def cmd_pin(self, user: dict, chat_id: int, code: str, message_id: int | None) -> None:
         user_id = int(user["id"])

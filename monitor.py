@@ -2364,3 +2364,817 @@ class Bot:
                 ab_mark = (" 🤖🟢" if ab.get("enabled") else "")
                 lines.append(f"• {html.escape(p2['name'])} — ID <code>{p2['user_id']}</code>, чатов: {len(p2['chats'])}, "
                              f"lzt: {'✅' if p2.get('lzt_token') else '—'}, tronaccs: {'✅
+                lines.append(f"• {html.escape(p2['name'])} — ID <code>{p2['user_id']}</code>, чатов: {len(p2['chats'])}, "
+                             f"lzt: {'✅' if p2.get('lzt_token') else '—'}, tronaccs: {'✅' if p2.get('tron_token') else '—'}"
+                             + (" 👑" if self.is_owner(p2['user_id']) else ""))
+            lines.append(f"\nАктивных кодов: {len(self.state.invites)}")
+            self.tg.send(chat_id, "Пользователи:\n" + "\n".join(lines))
+        elif command == "/kick" and self.is_owner(user_id):
+            if not arg.strip().lstrip("-").isdigit():
+                self.tg.send(chat_id, "Укажите ID: /kick 123456789 (список: /users)")
+                return
+            uid = int(arg)
+            if self.is_owner(uid):
+                self.tg.send(chat_id, "Владельца удалить нельзя.")
+                return
+            if self.state.remove_user(uid):
+                self.runtimes.pop(uid, None)
+                self.tg.send(chat_id, f"Пользователь {uid} удалён.")
+            else:
+                self.tg.send(chat_id, "Такого пользователя нет.")
+        else:
+            self.show_menu(p, chat_id, new_message=True)
+
+    def handle_awaiting(self, p: dict, chat_id: int, kind: str, text: str, message_id: int | None) -> None:
+        if kind == "eva_token":
+            token = text.strip()
+            if message_id:
+                self.tg.delete(chat_id, message_id)
+            p["eva_token"] = token
+            p["eva_auto"] = True
+            self.awaiting.pop(chat_id, None)
+            self.state.save()
+            self.tg.send(chat_id, "✅ Токен EVA TG сохранён, автозалив включён.\nПроверить: /eva")
+            return
+        if kind.startswith("ab_"):
+            ab = self.autobuy_state(p)
+            s = ab["settings"]
+            sub = kind[3:]
+            if sub == "country":
+                code = text.strip().upper()
+                if not re.fullmatch(r"[A-Z]{2}", code):
+                    self.tg.send(chat_id, "Нужен код из двух латинских букв, например UZ.")
+                    return
+                s["country"] = code
+            elif sub == "contacts":
+                if not text.strip().isdigit():
+                    self.tg.send(chat_id, "Нужно число.")
+                    return
+                s["contacts"] = int(text.strip())
+            elif sub in ("price_min", "price_max"):
+                digits = text.strip().replace(" ", "")
+                if not digits.isdigit():
+                    self.tg.send(chat_id, "Нужно число в рублях. 0 — без ограничения.")
+                    return
+                s[sub] = int(digits) or None
+            ab["seen"] = []
+            ab["attempts"] = {}
+            ab["init"] = False
+            self.awaiting.pop(chat_id, None)
+            self.state.save()
+            rt = self.runtime(p["user_id"])
+            if rt:
+                rt.rebuild()
+            self.show_autobuy(p, chat_id)
+            return
+        if kind in ("lzt_token", "tron_token"):
+            self.receive_token(p, chat_id, kind, text, message_id)
+            return
+        if kind in ("panel_url", "panel_token"):
+            value = text.strip()
+            if kind == "panel_url":
+                if not value.startswith(("http://", "https://")):
+                    self.tg.send(chat_id, "Нужен адрес, начинающийся с http. Или /panel для отмены.")
+                    return
+                p["upload_url"] = value
+                msg = "✅ Адрес панели сохранён."
+            else:
+                p["upload_token"] = value
+                msg = "✅ Токен панели сохранён."
+            self.awaiting.pop(chat_id, None)
+            self.state.save()
+            self.tg.send(chat_id, msg + " Текущие настройки: /panel")
+            return
+        s = self.current_settings(p)
+        if kind == "country":
+            code = text.strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", code):
+                self.show_page(p, chat_id, "Нужен код из двух латинских букв, например UZ. Или /settings для отмены.", self.back_keyboard(), "settings")
+                return
+            s["country"] = code
+        elif kind == "contacts":
+            if not text.strip().isdigit():
+                self.show_page(p, chat_id, "Нужно число, например 150. Или /settings для отмены.", self.back_keyboard(), "settings")
+                return
+            s["contacts"] = int(text.strip())
+        elif kind in ("price_min", "price_max"):
+            digits = text.strip().replace(" ", "")
+            if not digits.isdigit():
+                self.show_page(p, chat_id, "Нужно число в рублях, например 500. 0 — убрать ограничение. Или /settings для отмены.", self.back_keyboard(), "settings")
+                return
+            s[kind] = int(digits) or None
+        self.awaiting.pop(chat_id, None)
+        self.state.save()
+        self.show_settings(p, chat_id)
+
+    def cmd_panel(self, p: dict, chat_id: int, arg: str, message_id: int | None) -> None:
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower() if parts is not None and len(parts) > 0 and parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            url = p.get("upload_url") or "не задан"
+            self.tg.send(chat_id,
+                         "⬆️ Автозагрузка .session во внешнюю панель\n"
+                         f"Адрес: <code>{html.escape(url)}</code>\n"
+                         f"Токен: <code>{html.escape(_mask(p.get('upload_token')))}</code>\n"
+                         f"Поле файла: <code>{html.escape(p.get('upload_field') or 'file')}</code>\n\n"
+                         "Настроить:\n"
+                         "/panel url &lt;адрес&gt; — куда слать файл\n"
+                         "/panel token &lt;токен&gt; — ключ доступа панели\n"
+                         "/panel field &lt;имя&gt; — имя поля с файлом (по умолчанию file)\n"
+                         "/panel off — выключить\n\n"
+                         "Точный адрес и поле возьмите из панели: F12 → Network, загрузите там сессию вручную, "
+                         "правой кнопкой по запросу → Copy → Copy as cURL, и пришлите мне.")
+            return
+        if sub == "off":
+            p["upload_url"] = ""
+            self.state.save()
+            self.tg.send(chat_id, "🔕 Автозагрузка в панель выключена.")
+        elif sub == "url" and rest:
+            if not rest.startswith(("http://", "https://")):
+                self.tg.send(chat_id, "Адрес должен начинаться с http.")
+                return
+            p["upload_url"] = rest
+            self.state.save()
+            self.tg.send(chat_id, "✅ Адрес панели сохранён. Проверить: /panel")
+        elif sub == "url":
+            self.awaiting[chat_id] = (p["user_id"], "panel_url")
+            self.tg.send(chat_id, "Пришлите адрес загрузки (URL) панели одним сообщением.")
+        elif sub == "token":
+            if rest:
+                if message_id:
+                    self.tg.delete(chat_id, message_id)
+                p["upload_token"] = rest
+                self.state.save()
+                self.tg.send(chat_id, "✅ Токен панели сохранён.")
+            else:
+                self.awaiting[chat_id] = (p["user_id"], "panel_token")
+                self.tg.send(chat_id, "Пришлите токен панели одним сообщением.")
+        elif sub == "field" and rest:
+            p["upload_field"] = rest
+            self.state.save()
+            self.tg.send(chat_id, f"✅ Поле файла: {html.escape(rest)}")
+        else:
+            self.tg.send(chat_id, "Не понял. /panel — показать настройки и подсказку.")
+
+    def cmd_eva(self, p: dict, chat_id: int, arg: str, message_id: int | None) -> None:
+        parts = arg.split(maxsplit=1) if arg else []
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            self.tg.send(chat_id,
+                         "📤 <b>EVA TG (spammer-api)</b>\n"
+                         f"auto: {'on ✅' if p.get('eva_auto') else 'off'}\n"
+                         f"env: <code>{html.escape(p.get('eva_env') or 'prod')}</code>\n"
+                         f"run_spam: {'on ✅' if p.get('eva_run_spam') else 'off'}\n"
+                         f"token: <code>{html.escape(_mask(p.get('eva_token')))}</code>\n\n"
+                         "Команды:\n"
+                         "/eva token &lt;X-EVANGELION&gt;\n"
+                         "/eva auto on|off\n"
+                         "/eva env prod|dev\n"
+                         "/eva run on|off  (on = upload-run + спам, off = только залив)\n"
+                         "/eva url &lt;база&gt;  (переопределить URL)\n\n"
+                         "При включённом auto каждый купленный .session после покупки\n"
+                         "автоматически упакуется в zip и уйдёт в EVA TG.")
+            return
+        if sub == "token":
+            if rest:
+                if message_id:
+                    self.tg.delete(chat_id, message_id)
+                p["eva_token"] = rest
+                p["eva_auto"] = True
+                self.state.save()
+                self.tg.send(chat_id, "✅ Токен EVA TG сохранён, автозалив включён.")
+            else:
+                self.awaiting[chat_id] = (p["user_id"], "eva_token")
+                self.tg.send(chat_id, "Пришлите X-EVANGELION токен одним сообщением.")
+        elif sub == "auto":
+            p["eva_auto"] = rest.lower() == "on"
+            self.state.save()
+            self.tg.send(chat_id, f"✅ Автозалив EVA TG: {'on' if p['eva_auto'] else 'off'}")
+        elif sub == "env":
+            if rest not in ("prod", "dev"):
+                self.tg.send(chat_id, "prod или dev")
+                return
+            p["eva_env"] = rest
+            p["eva_url"] = EVA_PROD_BASE if rest == "prod" else EVA_DEV_BASE
+            self.state.save()
+            self.tg.send(chat_id, f"✅ env: {rest}\nURL: <code>{html.escape(p['eva_url'])}</code>")
+        elif sub == "run":
+            p["eva_run_spam"] = rest.lower() == "on"
+            self.state.save()
+            self.tg.send(chat_id, f"✅ run_spam: {'on' if p['eva_run_spam'] else 'off'}")
+        elif sub == "url" and rest:
+            p["eva_url"] = rest
+            self.state.save()
+            self.tg.send(chat_id, "✅ URL сохранён")
+        else:
+            self.tg.send(chat_id, "Не понял. /eva без аргументов — показать настройки.")
+
+    def cmd_pin(self, user: dict, chat_id: int, code: str, message_id: int | None) -> None:
+        user_id = int(user["id"])
+        if message_id:
+            self.tg.delete(chat_id, message_id)
+        if self.profile(user_id) is not None:
+            self.tg.send(chat_id, "У вас уже есть доступ. Команды: /help")
+            return
+        code = code.strip()
+        with self.state.lock:
+            valid = bool(code) and code in self.state.invites
+            if valid:
+                self.state.invites.remove(code)  # одноразовый
+                self.state.save()
+        if not valid:
+            log.info("Неверный код от пользователя %s", user_id)
+            self.tg.send(chat_id, "❌ Неверный или уже использованный код.")
+            return
+        log.info("Пользователь %s вошёл по коду", user_id)
+        self.start_registration(user, chat_id)
+
+    def cmd_token(self, p: dict, chat_id: int, arg: str, message_id: int | None) -> None:
+        parts = arg.split(maxsplit=1)
+        if not parts:
+            self.tg.send(chat_id, "Токены:\n"
+                                  f"lzt.market: <code>{html.escape(_mask(p.get('lzt_token')))}</code>\n"
+                                  f"tronaccs: <code>{html.escape(_mask(p.get('tron_token')))}</code>\n\n"
+                                  "Сменить: /token lzt или /token tron, затем пришлите токен сообщением.")
+            return
+        kind = parts[0].lower()
+        if kind not in ("lzt", "tron"):
+            self.tg.send(chat_id, "Укажите сайт: /token lzt или /token tron")
+            return
+        if len(parts) > 1:
+            if message_id:
+                self.tg.delete(chat_id, message_id)
+            self.receive_token(p, chat_id, f"{kind}_token", parts[1], None)
+            return
+        self.awaiting[chat_id] = (p["user_id"], f"{kind}_token")
+        self.tg.send(chat_id, f"Пришлите токен {'lzt.market' if kind == 'lzt' else 'tronaccs'} одним сообщением.")
+
+    def cmd_filter(self, p: dict, chat_id: int, arg: str) -> None:
+        if not arg:
+            self.tg.send(chat_id, "Текущий фильтр lzt.market:\n" + html.escape(lzt_site_url(p))
+                         + "\n\nСменить: пришлите <code>/filter https://lzt.market/telegram/?country[]=UZ&amp;spam=no</code>"
+                           "\nИли проще: /settings")
+            return
+        try:
+            category, query = parse_market_url(arg)
+        except ValueError as exc:
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
+            return
+        p["category"], p["query"] = category, query
+        p["settings"] = {}
+        self.state.reset_seen(p, "lzt")
+        self.tg.send(chat_id, "✅ Фильтр lzt.market обновлён:\n" + html.escape(lzt_site_url(p))
+                     + "\n\nТекущие лоты запомню молча, дальше буду присылать только новые.")
+
+    def cmd_tron(self, p: dict, rt: UserRuntime | None, chat_id: int, arg: str) -> None:
+        a = arg.lower()
+        if a in ("on", "вкл", "включить"):
+            if not p.get("tron_token"):
+                self.tg.send(chat_id, "⚠️ Нет токена tronaccs. Добавьте: /token tron")
+                return
+            p["tron_enabled"] = True
+            self.state.reset_seen(p, "tron")
+            if rt:
+                rt.rebuild()
+            self.tg.send(chat_id, "✅ tronaccs включён. Фильтр: " + (html.escape(p.get("tron_filter") or "") or "нет"))
+        elif a in ("off", "выкл", "стоп"):
+            p["tron_enabled"] = False
+            self.state.save()
+            if rt:
+                rt.rebuild()
+            self.tg.send(chat_id, "🔕 tronaccs выключен.")
+        else:
+            self.tg.send(chat_id, ("tronaccs: включён ✅" if rt and rt.tron else "tronaccs: выключен")
+                         + "\nФильтр: " + (html.escape(p.get("tron_filter") or "") or "нет")
+                         + "\n\n/tron on — включить, /tron off — выключить\n/tronfilter … — фильтр вручную, /trondump — поля лота")
+
+    def cmd_tronfilter(self, p: dict, rt: UserRuntime | None, chat_id: int, arg: str) -> None:
+        if not arg:
+            self.tg.send(chat_id, "Фильтр tronaccs: " + (html.escape(p.get("tron_filter") or "") or "нет")
+                         + "\n\nЗадать: <code>/tronfilter country=UZ contacts>=100 spam=no price<=500</code>\n"
+                           "Поля: price, contacts, dialogs, channels, chats, age, stars, spam, premium, 2fa, country, seller, title~слово.\n"
+                           "Условия: = != > < >= <= и ~ (содержит). Снять: /tronfilter off\nИли проще: /settings")
+            return
+        text = "" if arg.lower() in ("off", "нет", "снять") else arg
+        try:
+            parse_filter(text)
+        except ValueError as exc:
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
+            return
+        p["tron_filter"] = text
+        p["settings"] = {}
+        self.state.reset_seen(p, "tron")
+        if rt:
+            rt.rebuild()
+        self.tg.send(chat_id, "✅ Фильтр tronaccs: " + (html.escape(text) or "снят")
+                     + "\nТекущие подходящие лоты запомню молча, дальше буду присылать новые.")
+
+    def cmd_tronid(self, p: dict, rt: UserRuntime | None, chat_id: int, arg: str) -> None:
+        if not rt or rt.tron is None:
+            self.tg.send(chat_id, "tronaccs выключен или нет токена. /tron on, /token tron")
+            return
+        code = arg.strip().upper()
+        if code == "RESET":
+            with self.state.lock:
+                self.state.country_ids.clear()
+                self.state.save()
+            self.tg.send(chat_id, "Список ID стран очищен.")
+            return
+        manual = re.fullmatch(r"([A-Z]{2})[\s=:]+(\d+)", code)
+        if manual:
+            code, cid = manual.group(1), int(manual.group(2))
+            with self.state.lock:
+                self.state.country_ids[code] = cid
+                self.state.save()
+            rt.rebuild()
+            self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил.")
+            return
+        if not re.fullmatch(r"[A-Z]{2}", code):
+            known = ", ".join(f"{k}={v}" for k, v in sorted(self.state.country_ids.items())) or "пока нет"
+            self.tg.send(chat_id, "Найти перебором: <code>/tronid UZ</code>\nВписать вручную: <code>/tronid UZ 443</code>\n"
+                                  "Известные ID: " + html.escape(known))
+            return
+        if code in self.state.country_ids:
+            self.tg.send(chat_id, f"{code} = ID {self.state.country_ids[code]} (уже известен).")
+            return
+        self.tg.send(chat_id, f"🔎 Ищу ID страны {code} перебором через API tronaccs, до 5 минут…")
+        try:
+            cid = rt.tron.find_country_id(code, progress=lambda n: self.tg.send(chat_id, f"…проверил {n} ID"))
+        except (TronError, requests.RequestException) as exc:
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
+            return
+        if cid is None:
+            self.tg.send(chat_id, f"Не нашёл ID для {code}. Можно подсмотреть на сайте и вписать: /tronid {code} <число>")
+            return
+        with self.state.lock:
+            self.state.country_ids[code] = cid
+            self.state.save()
+        rt.rebuild()
+        self.tg.send(chat_id, f"✅ {code} = ID {cid}. Запомнил.")
+
+    def acquire_check(self, rt: UserRuntime, chat_id: int, wait: float = 20) -> bool:
+        """Ждём, пока закончится плановая проверка этого пользователя (если она идёт прямо сейчас)."""
+        if rt.lock.acquire(timeout=wait):
+            return True
+        err = rt.stats.get("last_error")
+        self.tg.send(chat_id, "⏳ Сейчас идёт плановая проверка, сайт отвечает медленно. Попробуйте через минуту."
+                     + (f"\nПоследняя ошибка ({_ago(rt.stats['last_error_at'])}): {html.escape(user_error(err))}" if err else ""))
+        return False
+
+    def start_check(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
+        message_id = self.show_page(p, chat_id, "🔎 <b>Проверка аккаунтов</b>\n\nЗапрашиваю данные площадок…",
+                                    self.back_keyboard(), "check", message_id)
+        if message_id is None:
+            return
+        name = f"/check:{chat_id}"
+        with self.jobs_lock:
+            job = self.jobs.get((p["user_id"], name))
+            if job is None or not job.is_alive():
+                self.run_in_background(p["user_id"], name, chat_id, self.cmd_check, p, rt, chat_id, message_id)
+
+    def cmd_check(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
+        if rt is None:
+            return
+        lines = ["🔎 <b>Результат проверки</b>"]
+        rows = []
+        if not rt.lock.acquire(timeout=20):
+            lines.append("\nПлановая проверка ещё выполняется. Попробуйте через минуту.")
+        else:
+            try:
+                for name, label, client in (("lzt", "lzt.market", rt.lzt), ("tron", "tronaccs", rt.tron)):
+                    lines.append("\n<b>" + label + "</b>")
+                    if client is None:
+                        lines.append("Поиск выключен или площадка не подключена.")
+                        continue
+                    client.last_error = None
+                    items = client.fetch_items(p["category"], lzt_params(p["query"]), retries=1) if name == "lzt" else client.fetch_items(retries=1)
+                    error = client.last_error
+                    rt.record_error(error)
+                    rt.stats[name + "_last_ok"] = not error
+                    rt.stats[name + "_last_error"] = error
+                    rt.stats[name + "_checked_at"] = time.time()
+                    rt.stats["last_items" if name == "lzt" else "tron_items"] = len(items)
+                    rt.stats["last_new" if name == "lzt" else "tron_new"] = sum(int(i["item_id"]) not in p["seen"][name] for i in items)
+                    if name == "tron":
+                        rt.stats["tron_total"] = client.last_total
+                    if error:
+                        lines.append("⚠️ " + html.escape(user_error(error)))
+                        continue
+                    lines.append(f"Подходящих в полученной выборке: <b>{len(items)}</b>")
+                    if not items:
+                        lines.append("Ничего не найдено. Проверьте страну, контакты и ограничение цены.")
+                    latest = sorted(items, key=lambda i: int(i.get("published_date") or 0), reverse=True)[:3]
+                    for item in latest:
+                        title = str(item.get("title") or "Аккаунт №" + str(item["item_id"]))[:80]
+                        lines.append("• " + html.escape(title) + " — " + html.escape(money(item.get("price"), item.get("price_currency") or "RUB")))
+                        # Reuse the existing validated item URL; keep manual results in one message.
+                        for row in self.item_keyboard(rt, item).get("inline_keyboard", []):
+                            for button in row:
+                                if button.get("url"):
+                                    rows.append([{"text": label + " · открыть №" + str(item["item_id"]), "url": button["url"]}])
+                                    break
+            finally:
+                rt.lock.release()
+        rows.extend(self.menu_keyboard()["inline_keyboard"])
+        with self.flow_lock:
+            if self.profile(p["user_id"]) is p and self.active_pages.get((p["user_id"], chat_id)) == ("check", message_id):
+                self.show_page(p, chat_id, "\n".join(lines), {"inline_keyboard": rows}, "check", message_id)
+
+    def cmd_lztdump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+        if not rt or rt.lzt is None:
+            self.tg.send(chat_id, "lzt.market: нет токена. Добавить: /token lzt")
+            return
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]), retries=1)
+        finally:
+            rt.lock.release()
+        if not items:
+            self.tg.send(chat_id, "lzt.market: лотов нет или сайт не ответил"
+                         + (f": {html.escape(user_error(rt.lzt.last_error))}" if rt.lzt.last_error else "."))
+            return
+        raw = {k: v for k, v in items[0].items() if not isinstance(v, (dict, list))}
+        self.tg.send(chat_id, "lzt.market: первый лот как отдаёт API:\n<pre>"
+                     + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
+
+    def cmd_trondump(self, p: dict, rt: UserRuntime | None, chat_id: int) -> None:
+        if not rt or rt.tron is None:
+            self.tg.send(chat_id, "tronaccs выключен или нет токена. /tron on, /token tron")
+            return
+        if not self.acquire_check(rt, chat_id):
+            return
+        try:
+            raw, count = rt.tron.fetch_raw_sample()
+        except (TronError, requests.RequestException) as exc:
+            self.tg.send(chat_id, "⚠️ " + html.escape(user_error(exc)))
+            return
+        finally:
+            rt.lock.release()
+        if raw is None:
+            self.tg.send(chat_id, "tronaccs вернул пустой список.")
+            return
+        self.tg.send(chat_id, f"tronaccs: лотов на первой странице {count}. Первый как есть:\n<pre>"
+                     + html.escape(json.dumps(raw, ensure_ascii=False, indent=1)[:3500]) + "</pre>")
+
+    def cmd_status(self, p: dict, rt: UserRuntime | None, chat_id: int, message_id: int | None = None) -> None:
+        if rt is None:
+            self.show_menu(p, chat_id, message_id)
+            return
+        st = dict(rt.stats)
+        lines = ["📊 <b>Статус мониторинга</b>",
+                 "\n🔔 Уведомления: " + ("включены" if chat_id in p.get("chats", []) else "выключены в этом чате"),
+                 f"⏱ Интервал проверки: {self.cfg.poll_interval} сек."]
+        for name, label, client, count_key, new_key in (("lzt", "lzt.market", rt.lzt, "last_items", "last_new"),
+                                                       ("tron", "tronaccs", rt.tron, "tron_items", "tron_new")):
+            lines.append("\n<b>" + label + "</b>")
+            if not p.get(name + "_enabled", True):
+                lines.append("⏸ Поиск на площадке выключен")
+                continue
+            if client is None:
+                lines.append("🔑 Площадка не подключена — добавьте ключ через /token")
+                continue
+            ok = st.get(name + "_last_ok")
+            lines.append("✅ Последняя проверка успешна" if ok is True else
+                         "⚠️ Не удалось выполнить последнюю проверку" if ok is False else "⏳ Ожидаю первую проверку по этим условиям")
+            try:
+                summary = lzt_criteria(p.get("query")) if name == "lzt" else tron_criteria(parse_filter(p.get("tron_filter") or ""))
+            except ValueError:
+                summary = "⚠️ Условия поиска не распознаны. Задайте их в настройках."
+            lines.append(html.escape(summary))
+            if ok is False:
+                lines.append("Количество аккаунтов сейчас неизвестно.")
+                error = st.get(name + "_last_error")
+                if error:
+                    lines.append(html.escape(user_error(error)))
+            elif st.get(count_key) is not None:
+                lines.append(f"Подходящих в последней проверке: <b>{st[count_key]}</b>")
+                lines.append(f"Новых в этой проверке: <b>{st.get(new_key, 0)}</b>")
+                if st[count_key] == 0:
+                    lines.append("По этим условиям ничего не найдено. Проверьте ограничение цены.")
+            checked_at = st.get(name + "_checked_at")
+            if checked_at:
+                lines.append("Проверено: " + _ago(checked_at))
+        # >>> AutoBuy <<<
+        ab = p.get("autobuy") or {}
+        ab_on = bool(ab.get("enabled"))
+        src = "lzt.market" if ab.get("source") == "lzt" else "tronaccs"
+        lines.append("\n🤖 <b>AutoBuy</b>: " + ("включён 🟢" if ab_on else "выключен 🔴")
+                     + (f" — {src}" if ab_on else ""))
+        if ab_on:
+            ab_s = ab.get("settings") or {}
+            try:
+                lines.append(html.escape(self._label(ab_s)))
+            except Exception:
+                pass
+        lines.append("\nСтарые аккаунты учитываются в результатах. Уведомления приходят только о новых.")
+        keyboard = {"inline_keyboard": [
+            [{"text": "🔄 Обновить статус", "callback_data": "nav:status"}, {"text": "🔎 Проверить сейчас", "callback_data": "nav:check"}],
+            [{"text": "🤖 AutoBuy", "callback_data": "nav:autobuy"}, {"text": "⚙️ Изменить условия", "callback_data": "nav:settings"}],
+            [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
+        ]}
+        self.show_page(p, chat_id, "\n".join(lines), keyboard, "status", message_id)
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                updates = self.tg.get_updates(self.state.tg_offset)
+                for update in updates:
+                    with self.state.lock:
+                        self.state.tg_offset = max(self.state.tg_offset, int(update["update_id"]) + 1)
+                    try:
+                        self.handle(update)
+                    except Exception:  # noqa: BLE001
+                        log.exception("Ошибка при обработке команды")
+                        message = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+                        chat_id = (message.get("chat") or {}).get("id")
+                        if chat_id is not None:
+                            try:
+                                self.tg.send(chat_id, "⚠️ Не удалось выполнить команду. Попробуйте ещё раз или откройте /help.")
+                            except Exception:
+                                log.exception("Не удалось сообщить об ошибке команды")
+                if updates:
+                    self.state.save()
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка в цикле бота")
+                time.sleep(5)
+
+
+# ---------- мониторинг ----------
+
+def deliver_new(bot: Bot, rt: UserRuntime, items: list[dict], new_items: list[dict], name: str) -> int:
+    """Первый запуск молчит, дальше шлём новые лоты в чаты пользователя."""
+    p, state, cfg, tg = rt.profile, bot.state, bot.cfg, bot.tg
+    seen = p["seen"][name]
+    if not p["init"][name]:
+        p["init"][name] = True
+        if not cfg.notify_on_first_run:
+            for item in items:
+                if int(item["item_id"]) not in seen:
+                    seen.append(int(item["item_id"]))
+            state.save()
+            log.info("%s/%s: первый запуск, запомнил %d лотов", p["user_id"], name, len(items))
+            return 0
+    new_items.sort(key=lambda i: int(i.get("published_date") or 0))
+    chats = rt.chats
+    if not chats:
+        for item in new_items:
+            seen.append(int(item["item_id"]))
+        state.save()
+        return 0
+    sent = 0
+    for item in new_items:
+        item_id = int(item["item_id"])
+        if tg.send_all(chats, format_item(item), bot.item_keyboard(rt, item)):
+            sent += 1
+            log.info("%s/%s: отправлен лот %d (%s)", p["user_id"], name, item_id, item.get("price"))
+        else:
+            log.error("%s/%s: не удалось отправить лот %d", p["user_id"], name, item_id)
+            continue
+        seen.append(item_id)
+        state.save()
+        time.sleep(1)
+    return sent
+
+
+def check_user(bot: Bot, rt: UserRuntime) -> None:
+    with rt.lock:
+        _check_user(bot, rt)
+
+
+DOWN_AFTER_FAILS = 2  # столько плановых проверок подряд с ошибкой = сайт «лёг»
+UP_AFTER_OKS = 2      # столько удачных проверок подряд после этого = сайт «встал» (один проскочивший запрос не считаем)
+
+
+def track_availability(bot: Bot, rt: UserRuntime, name: str, label: str, error: str | None) -> None:
+    """Пока сайт не отвечает — молчим (ошибка видна в /status и в логе). Когда снова ответил
+    после DOWN_AFTER_FAILS и более неудачных проверок подряд — одно сообщение «снова работает»."""
+    st = rt.stats
+    since_key, fails_key, oks_key = f"{name}_down_since", f"{name}_fails", f"{name}_oks"
+    st[f"{name}_last_ok"] = not error
+    st[f"{name}_last_error"] = error
+    st[f"{name}_checked_at"] = time.time()
+    if error:
+        st[fails_key] = st.get(fails_key, 0) + 1
+        st[oks_key] = 0
+        if st.get(since_key) is None and st[fails_key] >= DOWN_AFTER_FAILS:
+            st[since_key] = time.time()
+            log.warning("%s/%s: сайт не отвечает: %s", rt.profile["user_id"], name, error)
+        return
+    st[fails_key] = 0
+    st[oks_key] = st.get(oks_key, 0) + 1
+    since = st.get(since_key)
+    if since is not None and st[oks_key] >= UP_AFTER_OKS:
+        st[since_key] = None
+        log.info("%s/%s: сайт снова отвечает", rt.profile["user_id"], name)
+        bot.tg.send_all(rt.chats, f"🟢 {label} снова работает, не отвечал {_duration(time.time() - since)}. "
+                                  "Слежу за новыми лотами.")
+
+
+def _check_user(bot: Bot, rt: UserRuntime) -> None:
+    p, st = rt.profile, rt.stats
+    if rt.lzt is not None:
+        items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]))
+        st["checks"] += 1
+        st["last_check_at"] = time.time()
+        st["last_items"] = len(items)
+        st["last_new"] = 0
+        rt.record_error(rt.lzt.last_error)
+        track_availability(bot, rt, "lzt", "lzt.market", rt.lzt.last_error)
+        rt.lzt.last_error = None
+        if items:
+            seen = p["seen"]["lzt"]
+            new_items = [i for i in items if int(i["item_id"]) not in seen]
+            st["last_new"] = len(new_items)
+            log.info("%s/lzt: лотов %d, новых %d", p["user_id"], len(items), len(new_items))
+            deliver_new(bot, rt, items, new_items, "lzt")
+        else:
+            log.warning("%s/lzt: лотов нет (ошибка или пустой фильтр)", p["user_id"])
+    if rt.tron is not None:
+        items = rt.tron.fetch_items()
+        st["tron_total"] = rt.tron.last_total
+        st["tron_items"] = len(items)
+        st["tron_new"] = 0
+        rt.record_error(rt.tron.last_error)
+        track_availability(bot, rt, "tron", "tronaccs", rt.tron.last_error)
+        rt.tron.last_error = None
+        if items:
+            seen = p["seen"]["tron"]
+            new_items = [i for i in items if int(i["item_id"]) not in seen]
+            st["tron_new"] = len(new_items)
+            log.info("%s/tron: всего %d, под фильтр %d, новых %d", p["user_id"], rt.tron.last_total, len(items), len(new_items))
+            deliver_new(bot, rt, items, new_items, "tron")
+    # >>> AutoBuy <<<
+    if p.get("autobuy", {}).get("enabled"):
+        try:
+            check_autobuy(bot, rt)
+        except Exception:  # noqa: BLE001
+            log.exception("autobuy: ошибка у пользователя %s", p["user_id"])
+
+
+def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
+    """Автопокупка новых лотов по отдельным условиям профиля (блок autobuy).
+
+    Первая проверка после включения/смены фильтра — тихая: запоминаем уже существующие
+    лоты, чтобы не скупить старое. Дальше — покупаем по мере появления.
+    """
+    p, state = rt.profile, bot.state
+    ab = p.get("autobuy") or {}
+    if not ab.get("enabled"):
+        return
+    source = ab.get("source") or "lzt"
+    s = ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)
+    seen = ab.setdefault("seen", [])
+    attempts = ab.setdefault("attempts", {})
+    seen_set = set(seen)
+
+    if source == "lzt":
+        client = rt.lzt_ab
+        if client is None:
+            return
+        items = client.fetch_items(p.get("category") or "telegram",
+                                   autobuy_lzt_params(s), retries=2)
+        if client.last_error:
+            log.warning("%s/autobuy lzt: %s", p["user_id"], client.last_error)
+            return
+        site = "lzt.market"
+    else:
+        client = rt.tron_ab
+        if client is None:
+            return
+        items = client.fetch_items(retries=2)
+        if client.last_error:
+            log.warning("%s/autobuy tron: %s", p["user_id"], client.last_error)
+            return
+        site = "tronaccs"
+
+    new_items = [i for i in items if int(i["item_id"]) not in seen_set]
+
+    # Тихий первый прогон — просто запоминаем, что уже есть.
+    if not ab.get("init"):
+        ab["init"] = True
+        for item in new_items:
+            seen.append(int(item["item_id"]))
+        state.save()
+        log.info("%s/autobuy: тихая инициализация, запомнил %d лотов", p["user_id"], len(new_items))
+        return
+
+    new_items.sort(key=lambda i: int(i.get("published_date") or 0))
+    for item in new_items:
+        item_id = int(item["item_id"])
+        seen.append(item_id)
+        seen_set.add(item_id)
+
+        # 1) защита по цене
+        price = item.get("price")
+        if s.get("price_max") is not None and price is not None:
+            try:
+                if float(price) > float(s["price_max"]):
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+        # 2) анти-дребезг: не пытаемся купить один и тот же лот дважды в течение часа
+        last = attempts.get(str(item_id))
+        if last and time.time() - last < 3600:
+            continue
+
+        # 3) покупаем
+        if source == "lzt":
+            try:
+                price_int = int(price) if price is not None else None
+            except (TypeError, ValueError):
+                price_int = None
+            ok, msg = client.fast_buy(item_id, price_int)
+        else:
+            ok, msg = client.buy(item_id)
+        attempts[str(item_id)] = time.time()
+        log.info("%s/autobuy %s: лот %d → %s (%s)",
+                 p["user_id"], site, item_id, ok, msg)
+
+        chats = rt.chats
+        if ok:
+            if chats:
+                bot.tg.send_all(chats, f"🤖✅ <b>AutoBuy</b> купил лот {item_id} на {site}.\n\n"
+                                       + format_item(item))
+            target = chats[0] if chats else p["user_id"]
+            try:
+                bot.send_account_files(rt, target, item_id, site, client=client)
+            except Exception:
+                log.exception("autobuy: не удалось отправить файлы лота %d", item_id)
+        else:
+            if chats:
+                bot.tg.send_all(chats,
+                    f"🤖❌ <b>AutoBuy</b>: не удалось купить лот {item_id} на {site}.\n"
+                    f"Причина: {html.escape(user_error(msg))}\n"
+                    f"{item.get('url') or ''}")
+
+        # урезаем массивы
+        if len(seen) > MAX_SEEN_IDS:
+            del seen[:-MAX_SEEN_IDS]
+        if len(attempts) > MAX_SEEN_IDS:
+            keep = sorted(attempts.items(), key=lambda kv: kv[1], reverse=True)[:MAX_SEEN_IDS]
+            ab["attempts"] = dict(keep)
+            attempts = ab["attempts"]
+        state.save()
+        time.sleep(1)
+
+
+def main(argv: list[str]) -> int:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    cfg = Config()
+    cfg.validate()
+    tg = Telegram(cfg.tg_bot_token)
+    state = State(cfg.state_file, cfg)
+    bot = Bot(cfg, state, tg)
+    bot.ensure_owner_profile()
+
+    if "--test" in argv:
+        chats = [c for p in state.users.values() for c in p["chats"]]
+        if not chats:
+            print("Подписчиков нет: напишите боту /start")
+            return 1
+        ok = tg.send_all(chats, "✅ Монитор подключён.")
+        print(f"Тестовое сообщение отправлено в {ok} из {len(chats)} чатов")
+        return 0 if ok else 1
+
+    if "--dump" in argv:
+        rt = next(iter(bot.runtimes.values()), None)
+        if rt is None or rt.lzt is None:
+            print("Нет профиля с токеном lzt. Заполните LZT_TOKEN и TG_USER_ID в .env")
+            return 1
+        items = rt.lzt.fetch_items(rt.profile["category"], lzt_params(rt.profile["query"]))
+        print(json.dumps(items[:3], ensure_ascii=False, indent=2))
+        print(f"\nВсего лотов на первой странице: {len(items)}")
+        return 0
+
+    threading.Thread(target=bot.run_forever, name="telegram-bot", daemon=True).start()
+    log.info("Пользователей: %d, проверка каждые %d с", len(state.users), cfg.poll_interval)
+    if not state.users:
+        log.info("Задайте TG_USER_ID в .env или напишите боту /start, чтобы стать владельцем")
+    if cfg.notify_on_startup:
+        for p in list(state.users.values()):
+            if p["chats"]:
+                tg.send_all(p["chats"], "🟢 Монитор запущен. Фильтр lzt: " + html.escape(lzt_site_url(p))
+                            + "\nПришлю сообщение, как только появится новый лот. Проверить сейчас: /check")
+
+    once = "--once" in argv
+    while True:
+        for uid in list(bot.runtimes):
+            rt = bot.runtime(uid)
+            if rt is None:
+                continue
+            try:
+                check_user(bot, rt)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Ошибка при проверке пользователя %s", uid)
+                rt.record_error(f"{type(exc).__name__}: {exc}")
+        if once:
+            return 0
+        time.sleep(cfg.poll_interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))                                                                                      

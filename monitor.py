@@ -434,8 +434,18 @@ class TronClient:
         """
         self.rules = parse_filter(text)  # ValueError, если не разобрали
         self.params, self.local_rules = build_params(self.rules)
-        ids = country_ids or {}
+        ids = country_ids if country_ids is not None else {}
         codes = [v.upper() for k, op, v in self.local_rules if k in ("country", "страна") and op == "="]
+        if any(c not in ids for c in codes):
+            # Неизвестный код: подтягиваем справочник стран с сайта (код -> ID)
+            try:
+                fetched = self.api.countries()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("tronaccs: справочник стран не загрузился: %s", exc)
+                fetched = {}
+            if fetched:
+                ids.update(fetched)
+                log.info("tronaccs: загружен справочник стран, %d записей", len(fetched))
         known = [str(ids[c]) for c in codes if c in ids]
         if known and "country" not in self.params:
             self.params["country"] = ",".join(known)

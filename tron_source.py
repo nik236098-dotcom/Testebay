@@ -292,6 +292,29 @@ class TronApiClient:
             return data
         raise TronError("tronaccs: лимит запросов не снимается, попробуйте позже")
 
+    def countries(self) -> dict[str, int]:
+        """Справочник стран сайта: код -> ID. Отдаётся публичным API сайта (api.tronaccs.market/countries)."""
+        for url in ("https://api.tronaccs.market/countries", f"{TRON_API}/countries"):
+            try:
+                resp = requests.get(url, timeout=20, headers={"Accept": "application/json",
+                                                              "User-Agent": self.session.headers["User-Agent"]})
+                data = resp.json()
+            except (requests.RequestException, ValueError):
+                continue
+            items = data
+            if isinstance(data, dict):
+                items = data.get("countries") or data.get("items") or data.get("data") or data.get("result") or []
+            result = {}
+            for c in items if isinstance(items, list) else []:
+                if isinstance(c, dict) and c.get("countryCode") and c.get("id") is not None:
+                    try:
+                        result[str(c["countryCode"]).upper()] = int(c["id"])
+                    except (TypeError, ValueError):
+                        pass
+            if result:
+                return result
+        return {}
+
     def me(self) -> dict:
         """GET /me: баланс и валюта."""
         data = self._request("GET", "/me")

@@ -1649,6 +1649,7 @@ class Bot:
             return
         p["lzt_enabled"] = bool(s.get("lzt", True))
         p["tron_enabled"] = bool(s.get("tron", True))
+        changed = False
         if s.get("lzt", True):
             params = []
             if s["country"] != "any":
@@ -1661,9 +1662,13 @@ class Bot:
                 params.append(("pmin", str(s["price_min"])))
             if s.get("price_max") is not None:
                 params.append(("pmax", str(s["price_max"])))
-            p["category"] = "telegram"
-            p["query"] = "&".join(f"{k}={v}" for k, v in params)
-            self.state.reset_seen(p, "lzt")
+            new_query = "&".join(f"{k}={v}" for k, v in params)
+            # Память лотов сбрасываем только если фильтр реально изменился: иначе повторное
+            # «Сохранить» делало следующую проверку молчаливой и глотало всё, что появилось за минуту
+            if (p.get("category"), p.get("query")) != ("telegram", new_query) or not p["init"].get("lzt"):
+                p["category"], p["query"] = "telegram", new_query
+                self.state.reset_seen(p, "lzt")
+                changed = True
         if s.get("tron", True):
             parts = []
             if s["country"] != "any":
@@ -1676,8 +1681,11 @@ class Bot:
                 parts.append(f"price>={s['price_min']}")
             if s.get("price_max") is not None:
                 parts.append(f"price<={s['price_max']}")
-            p["tron_filter"] = " ".join(parts)
-            self.state.reset_seen(p, "tron")
+            new_filter = " ".join(parts)
+            if p.get("tron_filter") != new_filter or not p["init"].get("tron"):
+                p["tron_filter"] = new_filter
+                self.state.reset_seen(p, "tron")
+                changed = True
         self.state.save()
         if rt:
             rt.rebuild()
@@ -1690,7 +1698,8 @@ class Bot:
                 rt.stats.pop(name + "_checked_at", None)
         self.show_page(p, chat_id, "✅ <b>Условия поиска сохранены</b>\n\n"
                        + html.escape(self._label(s))
-                       + "\n\nСтарые аккаунты будут учтены при следующей проверке. Уведомления придут о новых.",
+                       + ("\n\nСтарые аккаунты будут учтены при следующей проверке. Уведомления придут о новых."
+                          if changed else "\n\nУсловия не изменились, слежу дальше без пропусков."),
                        self.menu_keyboard(), "saved", message_id)
 
     def handle_settings_callback(self, cq: dict, parts: list[str]) -> None:
@@ -2949,6 +2958,7 @@ def deliver_new(bot: Bot, rt: UserRuntime, items: list[dict], new_items: list[di
     new_items.sort(key=lambda i: int(i.get("published_date") or 0))
     chats = rt.chats
     if not chats:
+        log.warning("%s/%s: %d новых лотов, но ни один чат не подписан (/start) — пропускаю", p["user_id"], name, len(new_items))
         for item in new_items:
             seen.append(int(item["item_id"]))
         state.save()

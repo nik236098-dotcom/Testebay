@@ -16,6 +16,10 @@
     TRON_FILTER      - фильтр tronaccs по умолчанию, "country=UZ contacts>=100 spam=no"
     POLL_INTERVAL    - период опроса в секундах, по умолчанию 60
     STATE_FILE       - путь к файлу состояния, по умолчанию state.json
+    EVA_URL          - база EVA TG spammer-api, по умолчанию https://api.eva-sms.cc/api/v1
+    EVA_TOKEN        - X-EVANGELION токен владельца (необязательно)
+    EVA_ENV          - prod | dev
+    EVA_RUN_SPAM     - 1 = upload-run (сразу спам), 0 = только залив
 """
 
 from __future__ import annotations
@@ -57,6 +61,9 @@ DEFAULT_TRON_FILTER = "country=UZ contacts>=100 spam=no"
 MAX_SEEN_IDS = 5000
 TELEGRAM_MESSAGE_LIMIT = 4096
 MSK = timezone(timedelta(hours=3))
+
+EVA_PROD_BASE = "https://api.eva-sms.cc/api/v1"
+EVA_DEV_BASE = "/spammer-api/api/v1"
 
 
 def _ago(ts) -> str:
@@ -105,6 +112,11 @@ class Config:
         self.panel_url = os.getenv("PANEL_URL", "").strip()
         self.panel_token = os.getenv("PANEL_TOKEN", "").strip()
         self.panel_field = os.getenv("PANEL_FIELD", "file").strip() or "file"
+        # EVA TG (spammer-api) — автозалив архива .session после покупки
+        self.eva_url = os.getenv("EVA_URL", EVA_PROD_BASE).strip()
+        self.eva_token = os.getenv("EVA_TOKEN", "").strip()
+        self.eva_env = os.getenv("EVA_ENV", "prod").strip().lower()
+        self.eva_run_spam = os.getenv("EVA_RUN_SPAM", "1") == "1"
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -162,6 +174,12 @@ def new_profile(user_id: int, name: str, chat_id: int | None, cfg: Config, with_
         "upload_url": cfg.panel_url if with_env_tokens else "",
         "upload_token": cfg.panel_token if with_env_tokens else "",
         "upload_field": cfg.panel_field,
+        # EVA TG (spammer-api)
+        "eva_url": cfg.eva_url if with_env_tokens else EVA_PROD_BASE,
+        "eva_token": cfg.eva_token if with_env_tokens else "",
+        "eva_env": cfg.eva_env,
+        "eva_run_spam": cfg.eva_run_spam,
+        "eva_auto": bool(cfg.eva_token) if with_env_tokens else False,
     }
 
 
@@ -797,6 +815,71 @@ def upload_session(url: str, token: str, field: str, filename: str, content: byt
     return False, f"HTTP {resp.status_code}: {body}"
 
 
+def upload_to_eva_tg(base_url: str, token: str, field: str, files: list[tuple[str, bytes]],
+                     run_spam: bool = True) -> tuple[bool, str]:
+    """Заливает .session-файлы архивом в EVA TG (spammer-api).
+
+    run_spam=True  → POST /spam/upload-run   (залить и сразу в очередь)
+    run_spam=False → POST /sessions/upload   (только залить)
+
+    Content-Type не ставим — requests сам выставит multipart/form-data.
+    """
+    import io
+    import zipfile
+
+    if not token:
+        return False, "нет X-EVANGELION токена"
+    if not files:
+        return False, "нет .session для отправки"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in files:
+            z.writestr(name, content)
+    data = buf.getvalue()
+
+    if not data:
+        return False, "empty_file"
+    if len(data) > 240 * 1024 * 1024:
+        return False, f"too_large: {len(data) / 1048576:.1f} MB > 240 MB"
+
+    endpoint = "/spam/upload-run" if run_spam else "/sessions/upload"
+    url = base_url.rstrip("/") + endpoint
+    headers = {"X-EVANGELION": token}  # Content-Type НЕ ставим
+
+    try:
+        resp = requests.post(url, headers=headers,
+                             files={field or "file": ("sessions.zip", data)},
+                             timeout=300)
+    except requests.RequestException as exc:
+        return False, f"сеть: {exc}"
+
+    try:
+        j = resp.json()
+    except ValueError:
+        return resp.ok, resp.text[:200]
+    if not isinstance(j, dict):
+        return resp.ok, str(j)[:200]
+
+    if j.get("status") is False:
+        code = str(j.get("error") or j.get("code") or "?")
+        if "Too Many" in code or "blocked" in code.lower():
+            return False, "rate limit: " + code
+        return False, code
+
+    if "total" in j:
+        return True, f"залито сессий: {j['total']}"
+    bid = j.get("batch_id") or j.get("batchId") or "?"
+    uq = j.get("upload_quota") or {}
+    sq = j.get("sessions_quota") or {}
+    parts = [f"batch {bid}"]
+    if uq:
+        parts.append(f"upload {uq.get('active','?')}/{uq.get('limit','?')}")
+    if sq:
+        parts.append(f"sessions {sq.get('active','?')}/{sq.get('limit','?')}")
+    return True, ", ".join(parts)
+
+
 def stringsession_to_session(session_str: str) -> bytes | None:
     """Строковую сессию Telethon -> настоящий .session (SQLite), без внешних библиотек."""
     parsed = _parse_telethon_string(session_str)
@@ -1047,6 +1130,7 @@ class Bot:
         "/status — что мониторится, балансы, последняя проверка\n"
         "/token — показать или сменить токены API\n"
         "/panel — автозагрузка купленной сессии во внешнюю панель\n"
+        "/eva — EVA TG: автозалив архива .session после покупки\n"
         "/filter <ссылка> — фильтр lzt.market ссылкой с сайта\n"
         "/tron on|off, /tronfilter … — tronaccs вручную\n"
         "/tronid UZ — узнать ID страны на tronaccs\n"
@@ -1434,7 +1518,7 @@ class Bot:
         elif not sessions:
             self.tg.send(chat_id, "📎 Готовый .session собрать не удалось. Данные во вложенном JSON или на странице лота. "
                                   "Если нужен именно .session, пришлите структуру ответа (названия полей).")
-        # Автозагрузка .session во внешнюю панель
+        # Автозагрузка .session во внешнюю панель (evangelion и т.п.)
         prof = rt.profile
         url = prof.get("upload_url")
         if url and sessions:
@@ -1443,6 +1527,19 @@ class Bot:
                 log.info("panel upload %s: %s — %s", name, ok2, info)
                 self.tg.send(chat_id, (f"⬆️ Панель: {name} загружен. {html.escape(info)}" if ok2
                                        else f"⚠️ Панель: {name} не загрузился. {html.escape(info)}"))
+
+        # Автозалив архива .session в EVA TG (spammer-api)
+        if sessions and prof.get("eva_auto") and prof.get("eva_token"):
+            ok3, info3 = upload_to_eva_tg(
+                prof.get("eva_url") or EVA_PROD_BASE,
+                prof["eva_token"],
+                "file",
+                sessions,
+                run_spam=bool(prof.get("eva_run_spam", True)),
+            )
+            log.info("eva tg upload для лота %s: %s — %s", item_id, ok3, info3)
+            self.tg.send(chat_id, (f"📤 EVA TG: {html.escape(info3)}" if ok3
+                                   else f"⚠️ EVA TG: не залилось — {html.escape(info3)}"))
 
     # --- регистрация и токены ---
 
@@ -1574,6 +1671,8 @@ class Bot:
             self.cmd_token(p, chat_id, arg, message_id)
         elif command == "/panel":
             self.cmd_panel(p, chat_id, arg, message_id)
+        elif command == "/eva":
+            self.cmd_eva(p, chat_id, arg, message_id)
         elif command == "/filter":
             self.cmd_filter(p, chat_id, arg)
         elif command == "/check":
@@ -1645,6 +1744,16 @@ class Bot:
             self.tg.send(chat_id, self.HELP + (self.OWNER_HELP if self.is_owner(user_id) else ""))
 
     def handle_awaiting(self, p: dict, chat_id: int, kind: str, text: str, message_id: int | None) -> None:
+        if kind == "eva_token":
+            token = text.strip()
+            if message_id:
+                self.tg.delete(chat_id, message_id)
+            p["eva_token"] = token
+            p["eva_auto"] = True
+            self.awaiting.pop(chat_id, None)
+            self.state.save()
+            self.tg.send(chat_id, "✅ Токен EVA TG сохранён, автозалив включён.\nПроверить: /eva")
+            return
         if kind in ("lzt_token", "tron_token"):
             self.receive_token(p, chat_id, kind, text, message_id)
             return
@@ -1734,6 +1843,60 @@ class Bot:
             self.tg.send(chat_id, f"✅ Поле файла: {html.escape(rest)}")
         else:
             self.tg.send(chat_id, "Не понял. /panel — показать настройки и подсказку.")
+
+    def cmd_eva(self, p: dict, chat_id: int, arg: str, message_id: int | None) -> None:
+        parts = arg.split(maxsplit=1) if arg else []
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            self.tg.send(chat_id,
+                         "📤 <b>EVA TG (spammer-api)</b>\n"
+                         f"auto: {'on ✅' if p.get('eva_auto') else 'off'}\n"
+                         f"env: <code>{html.escape(p.get('eva_env') or 'prod')}</code>\n"
+                         f"run_spam: {'on ✅' if p.get('eva_run_spam') else 'off'}\n"
+                         f"token: <code>{html.escape(_mask(p.get('eva_token')))}</code>\n\n"
+                         "Команды:\n"
+                         "/eva token &lt;X-EVANGELION&gt;\n"
+                         "/eva auto on|off\n"
+                         "/eva env prod|dev\n"
+                         "/eva run on|off  (on = upload-run + спам, off = только залив)\n"
+                         "/eva url &lt;база&gt;  (переопределить URL)\n\n"
+                         "При включённом auto каждый купленный .session после покупки\n"
+                         "автоматически упакуется в zip и уйдёт в EVA TG.")
+            return
+        if sub == "token":
+            if rest:
+                if message_id:
+                    self.tg.delete(chat_id, message_id)
+                p["eva_token"] = rest
+                p["eva_auto"] = True
+                self.state.save()
+                self.tg.send(chat_id, "✅ Токен EVA TG сохранён, автозалив включён.")
+            else:
+                self.awaiting[chat_id] = (p["user_id"], "eva_token")
+                self.tg.send(chat_id, "Пришлите X-EVANGELION токен одним сообщением.")
+        elif sub == "auto":
+            p["eva_auto"] = rest.lower() == "on"
+            self.state.save()
+            self.tg.send(chat_id, f"✅ Автозалив EVA TG: {'on' if p['eva_auto'] else 'off'}")
+        elif sub == "env":
+            if rest not in ("prod", "dev"):
+                self.tg.send(chat_id, "prod или dev")
+                return
+            p["eva_env"] = rest
+            p["eva_url"] = EVA_PROD_BASE if rest == "prod" else EVA_DEV_BASE
+            self.state.save()
+            self.tg.send(chat_id, f"✅ env: {rest}\nURL: <code>{html.escape(p['eva_url'])}</code>")
+        elif sub == "run":
+            p["eva_run_spam"] = rest.lower() == "on"
+            self.state.save()
+            self.tg.send(chat_id, f"✅ run_spam: {'on' if p['eva_run_spam'] else 'off'}")
+        elif sub == "url" and rest:
+            p["eva_url"] = rest
+            self.state.save()
+            self.tg.send(chat_id, "✅ URL сохранён")
+        else:
+            self.tg.send(chat_id, "Не понял. /eva без аргументов — показать настройки.")
 
     def cmd_pin(self, user: dict, chat_id: int, code: str, message_id: int | None) -> None:
         user_id = int(user["id"])

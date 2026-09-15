@@ -346,6 +346,20 @@ class TronApiClient:
                 break
         return list(items.values())
 
+    def item_detail(self, item_id: int) -> dict | None:
+        """Данные купленного аккаунта: GET /items/{id}, запасной вариант /item/{id}."""
+        for path in (f"/items/{item_id}", f"/item/{item_id}"):
+            try:
+                data = self._request("GET", path)
+            except (TronError, requests.RequestException):
+                continue
+            if isinstance(data, dict):
+                for key in ("item", "account", "data", "result"):
+                    if isinstance(data.get(key), dict):
+                        return data[key]
+                return data
+        return None
+
     def buy(self, item_id: int) -> tuple[bool, str]:
         try:
             data = self._request("POST", f"/items/{item_id}/purchase", timeout=90)

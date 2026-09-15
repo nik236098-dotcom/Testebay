@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -98,6 +99,7 @@ class Config:
         self.notify_on_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "0") == "1"
         self.notify_on_startup = os.getenv("NOTIFY_ON_STARTUP", "1") == "1"
         self.buy_confirm = os.getenv("BUY_CONFIRM", "0") == "1"
+        self.send_session_files = os.getenv("SEND_SESSION_FILES", "1") == "1"
         self.state_file = Path(os.getenv("STATE_FILE", "state.json"))
 
     def validate(self) -> None:
@@ -348,6 +350,24 @@ class LztClient:
             return False, f"Маркет вернул состояние лота: {item.get('item_state')}"
         return True, "Покупка прошла. Данные аккаунта на странице лота."
 
+    def account_data(self, item_id: int) -> dict | None:
+        """GET /{item_id}: данные купленного аккаунта (loginData, tdata и т.п.)."""
+        try:
+            resp = self.session.get(f"{API_BASE}/{item_id}", timeout=60)
+            data = resp.json()
+        except (requests.RequestException, ValueError):
+            return None
+        if isinstance(data, dict):
+            return data.get("item") if isinstance(data.get("item"), dict) else data
+        return None
+
+    def download(self, url: str) -> bytes | None:
+        try:
+            resp = self.session.get(url, timeout=120)
+            return resp.content if resp.ok else None
+        except requests.RequestException:
+            return None
+
 
 class WebClient:
     """lzt без API: разбор HTML-страницы каталога (см. web_source.py)."""
@@ -444,6 +464,16 @@ class TronClient:
     def buy(self, item_id: int) -> tuple[bool, str]:
         return self.api.buy(item_id)
 
+    def account_data(self, item_id: int) -> dict | None:
+        return self.api.item_detail(item_id)
+
+    def download(self, url: str) -> bytes | None:
+        try:
+            resp = self.api.session.get(url, timeout=120)
+            return resp.content if resp.ok else None
+        except requests.RequestException:
+            return None
+
 
 # ---------- Telegram ----------
 
@@ -484,6 +514,29 @@ class Telegram:
 
     def send_all(self, chat_ids: list[int], text: str, reply_markup: dict | None = None) -> int:
         return sum(1 for c in list(chat_ids) if self.send(c, text, reply_markup))
+
+    def send_document(self, chat_id: int | str, filename: str, content: bytes, caption: str = "") -> bool:
+        for attempt in range(1, 4):
+            try:
+                resp = self.session.post(
+                    f"{self.base}/sendDocument",
+                    data={"chat_id": chat_id, "caption": caption[:1024]},
+                    files={"document": (filename, content)},
+                    timeout=120,
+                )
+                data = resp.json()
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("Telegram sendDocument: ошибка (попытка %d): %s", attempt, exc)
+                time.sleep(3 * attempt)
+                continue
+            if resp.status_code == 429:
+                time.sleep(int(data.get("parameters", {}).get("retry_after", 5)))
+                continue
+            if resp.ok and data.get("ok"):
+                return True
+            log.error("Telegram sendDocument: %d: %s", resp.status_code, resp.text[:300])
+            return False
+        return False
 
     def edit_text(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
         payload = {"chat_id": chat_id, "message_id": message_id, "text": text[:TELEGRAM_MESSAGE_LIMIT],
@@ -558,6 +611,116 @@ def _first(item: dict, *keys: str):
         if value not in (None, "", []):
             return value
     return None
+
+
+# ---------- файлы сессии купленного аккаунта ----------
+
+# Ключи с данными для входа: подпись -> список подстрок в имени поля
+SESSION_KEYS = {
+    "tdata": ("tdata",),
+    "telethon": ("telethon",),
+    "pyrogram": ("pyrogram",),
+    "session": ("session_string", "stringsession", "string_session", "session"),
+    "json": ("telegram_json", "tg_json", "account_json"),
+}
+# Короткие поля в текстовую сводку
+INFO_KEYS = {
+    "phone": ("phone", "telegram_phone", "number"),
+    "authkey": ("auth_key", "authkey"),
+    "dc_id": ("dc_id", "dcid", "telegram_dc_id"),
+    "user_id": ("telegram_id", "tg_id", "user_id"),
+    "username": ("telegram_username", "username"),
+    "2fa / пароль": ("twofa", "two_fa", "password", "cloud_password"),
+    "first_name": ("first_name", "telegram_full_name"),
+}
+_B64_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]+$")
+
+
+def _maybe_binary(value: str) -> bytes | None:
+    """Если строка — base64 архива/файла (tdata обычно zip), вернуть его байты."""
+    s = value.strip()
+    if len(s) < 100 or not _B64_RE.match(s):
+        return None
+    try:
+        raw = base64.b64decode(s, validate=False)
+    except (ValueError, Exception):  # noqa: BLE001
+        return None
+    if raw[:2] in (b"PK", b"\x1f\x8b") or raw[:4] == b"Rar!":  # zip, gzip, rar
+        return raw
+    return None
+
+
+def _flatten(data, prefix: str = "") -> dict[str, object]:
+    out: dict[str, object] = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            out.update(_flatten(v, f"{prefix}{k}."))
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            out.update(_flatten(v, f"{prefix}{i}."))
+    else:
+        out[prefix.rstrip(".")] = data
+    return out
+
+
+def build_account_files(item_id: int, data, downloader=None) -> tuple[list[tuple[str, bytes]], str]:
+    """Из данных купленного аккаунта собирает файлы (имя, байты) и текстовую сводку.
+
+    Формат ответа маркетов заранее не известен, поэтому: полный ответ всегда
+    сохраняется в JSON, известные поля сессии выкладываются отдельными файлами,
+    ссылки на файлы (tdata.zip и т.п.) скачиваются, короткие поля идут в сводку.
+    """
+    files: list[tuple[str, bytes]] = []
+    used_names: set[str] = set()
+
+    def add(name: str, content: bytes) -> None:
+        base, dot, ext = name.rpartition(".")
+        stem = base or name
+        final = name
+        n = 2
+        while final in used_names:
+            final = f"{stem}_{n}{dot}{ext}"
+            n += 1
+        used_names.add(final)
+        files.append((final, content))
+
+    # Полный ответ — всегда, чтобы ничего не потерять
+    add(f"{item_id}.json", json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+    flat = _flatten(data)
+    info_lines: list[str] = []
+    for key, value in flat.items():
+        low = key.lower()
+        # Короткие информационные поля
+        for label, subs in INFO_KEYS.items():
+            if any(low == s or low.endswith("." + s) for s in subs) and value not in (None, "", 0):
+                info_lines.append(f"{label}: {value}")
+                break
+        if not isinstance(value, str) or len(value) < 20:
+            continue
+        # Ссылка на файл — скачиваем
+        if value.startswith(("http://", "https://")) and downloader is not None:
+            low_url = value.lower().split("?")[0]
+            if any(low_url.endswith(e) for e in (".zip", ".rar", ".session", ".json", ".7z")) or "download" in low_url:
+                blob = downloader(value)
+                if blob:
+                    ext = low_url.rsplit(".", 1)[-1] if "." in low_url else "bin"
+                    add(f"{item_id}_{key.split('.')[-1]}.{ext}", blob)
+                continue
+        # base64 архива (обычно tdata)
+        binary = _maybe_binary(value)
+        if binary is not None:
+            add(f"{item_id}_{key.split('.')[-1]}.zip", binary)
+            continue
+        # Известные текстовые сессии
+        for label, subs in SESSION_KEYS.items():
+            if any(s in low for s in subs):
+                ext = "json" if label == "json" else "txt"
+                add(f"{item_id}_{label}.{ext}", value.encode("utf-8"))
+                break
+
+    summary = "\n".join(dict.fromkeys(info_lines))  # без дублей, порядок сохранён
+    return files, summary
 
 
 def _fmt_date(ts) -> str:
@@ -1037,17 +1200,49 @@ class Bot:
         elif action in ("buy", "confirm"):
             self.tg.answer_callback(cq_id, "Покупаю…")
             self.tg.edit_markup(chat_id, message_id, self.item_keyboard(rt, item, "done"))
-            ok, text = rt.tron.buy(item_id) if is_tron else rt.lzt.fast_buy(item_id, price)
+            client = rt.tron if is_tron else rt.lzt
+            ok, text = client.buy(item_id) if is_tron else client.fast_buy(item_id, price)
             site = "tronaccs" if is_tron else "lzt.market"
             log.info("%s: покупка лота %d за %s пользователем %s: %s — %s", site, item_id, price, user_id, ok, text)
             if ok:
                 self.tg.send(chat_id, f"✅ {site}: куплен лот {item_id} за {self._price_label(price, None)}.\n"
                                       f"{html.escape(text)}\n{item_url}")
+                self.send_account_files(rt, chat_id, item_id, site)
             else:
                 self.tg.send(chat_id, f"❌ {site}: не удалось купить лот {item_id}: {html.escape(text)}\n{item_url}",
                              self.item_keyboard(rt, item, "buy"))
         else:
             self.tg.answer_callback(cq_id)
+
+    def send_account_files(self, rt: UserRuntime, chat_id: int, item_id: int, site: str) -> None:
+        """После покупки выгружает данные аккаунта (сессия, tdata и т.п.) файлами."""
+        if not self.cfg.send_session_files:
+            return
+        client = rt.tron if site == "tronaccs" else rt.lzt
+        if client is None or not hasattr(client, "account_data"):
+            return
+        data = client.account_data(item_id)
+        if not data:
+            self.tg.send(chat_id, "📎 Не удалось автоматически выгрузить данные аккаунта. "
+                                  "Заберите их на странице лота или в «Мои покупки».")
+            return
+        try:
+            files, summary = build_account_files(item_id, data, getattr(client, "download", None))
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось собрать файлы аккаунта %s", item_id)
+            files, summary = [], ""
+        if summary:
+            self.tg.send(chat_id, f"🔑 Данные аккаунта {item_id}:\n<pre>{html.escape(summary)}</pre>")
+        sent = 0
+        for name, content in files:
+            if len(content) > 49 * 1024 * 1024:  # лимит Telegram на документ
+                continue
+            if self.tg.send_document(chat_id, name, content, caption=f"{site}: аккаунт {item_id}"):
+                sent += 1
+        if sent:
+            log.info("%s: выгружено %d файлов аккаунта %d пользователю %s", site, sent, item_id, rt.profile["user_id"])
+        else:
+            self.tg.send(chat_id, "📎 Файлы аккаунта отправить не удалось, данные во вложенном JSON или на странице лота.")
 
     # --- регистрация и токены ---
 

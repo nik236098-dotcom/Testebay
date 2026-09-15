@@ -284,6 +284,14 @@ def _body_snippet(resp, limit: int = 120) -> str:
     техработ) убираем теги, чтобы было видно, кто именно ответил."""
     text = resp.text or ""
     server = resp.headers.get("Server", "")
+    try:  # JSON вида {"errors": ["Технические работы…"]} показываем текстом, а не \uXXXX
+        data = json.loads(text)
+        if isinstance(data, dict):
+            msgs = data.get("errors") or data.get("message") or data.get("error")
+            msgs = msgs if isinstance(msgs, list) else [msgs]
+            text = "; ".join(str(m) for m in msgs if m) or text
+    except ValueError:
+        pass
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = " ".join(text.split())

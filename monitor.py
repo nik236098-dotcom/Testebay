@@ -1889,7 +1889,6 @@ class Bot:
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "ab:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "ab:view:spam"}],
             [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "ab:view:price"}],
-            [{"text": "🔄 Взять условия из поиска", "callback_data": "ab:sync:0"}],
             [{"text": "💾 Сохранить условия", "callback_data": "ab:apply:0"}],
             [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
         ]}
@@ -2028,21 +2027,6 @@ class Bot:
             autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")
-        elif kind == "sync":
-            # Копируем условия из /settings, чтобы AutoBuy покупал ровно те лоты, что показывает
-            # поиск, — тогда проверка и покупка идут одним запросом, без второго обращения к сайту.
-            reg = self.current_settings(p)
-            for k in ("country", "contacts", "spam", "price_min", "price_max"):
-                if k in reg:
-                    s[k] = reg[k]
-            autobuy_reset(ab)
-            self.state.save()
-            rt = self.runtime(user_id)
-            if rt:
-                rt.rebuild()
-            self.show_autobuy(p, chat_id, message_id, "main")
-            self.tg.answer_callback(cq_id, "Условия AutoBuy теперь как в поиске")
-            return
         elif kind == "apply":
             self.apply_autobuy_settings(p, chat_id, message_id)
         self.tg.answer_callback(cq_id)

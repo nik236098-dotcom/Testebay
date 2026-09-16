@@ -213,6 +213,44 @@ AUTOBUY_DEFAULT_SETTINGS = {
     "tron": False,
 }
 
+def _num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def autobuy_can_reuse_lzt(search_params: list[tuple[str, str]], ab_params: list[tuple[str, str]]) -> bool:
+    """AutoBuy может брать список поиска, если условия совпадают во всём, кроме цены, и поиск
+    по цене не уже AutoBuy (широкий поиск уже содержит все дешёвые лоты — цену AutoBuy
+    отфильтрует сам, второй запрос к сайту не нужен)."""
+    skip = ("pmin", "pmax", "order_by", "page")
+    if sorted(kv for kv in search_params if kv[0] not in skip) != sorted(kv for kv in ab_params if kv[0] not in skip):
+        return False
+    sp, ap = dict(search_params), dict(ab_params)
+    s_min, s_max, a_min, a_max = _num(sp.get("pmin")), _num(sp.get("pmax")), _num(ap.get("pmin")), _num(ap.get("pmax"))
+    if s_min is not None and (a_min is None or s_min > a_min):
+        return False
+    if s_max is not None and (a_max is None or s_max < a_max):
+        return False
+    return True
+
+
+def autobuy_can_reuse_tron(search_filter: str, ab_filter: str) -> bool:
+    """То же для tronaccs: правила совпадают во всём, кроме цены, и поиск по цене не уже AutoBuy."""
+    try:
+        sr, ar = parse_filter(search_filter or ""), parse_filter(ab_filter or "")
+    except ValueError:
+        return False
+    is_price = lambda r: r[0] in ("price", "цена")
+    if sorted(r for r in sr if not is_price(r)) != sorted(r for r in ar if not is_price(r)):
+        return False
+    s_price = sorted(r for r in sr if is_price(r))
+    if not s_price:
+        return True  # поиск без ограничений по цене — содержит всё, что нужно AutoBuy
+    return s_price == sorted(r for r in ar if is_price(r))
+
+
 AUTOBUY_SITES = ("lzt", "tron")
 AUTOBUY_SITE_LABELS = {"lzt": "lzt.market", "tron": "tronaccs"}
 
@@ -1889,7 +1927,7 @@ class Bot:
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "ab:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "ab:view:spam"}],
             [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "ab:view:price"}],
-            [{"text": "🔄 Взять условия из поиска", "callback_data": "ab:sync:0"}],
+            [{"text": "🔄 Страна/контакты/спам как в поиске", "callback_data": "ab:sync:0"}],
             [{"text": "💾 Сохранить условия", "callback_data": "ab:apply:0"}],
             [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
         ]}
@@ -2031,8 +2069,11 @@ class Bot:
         elif kind == "sync":
             # Копируем условия из /settings, чтобы AutoBuy покупал ровно те лоты, что показывает
             # поиск, — тогда проверка и покупка идут одним запросом, без второго обращения к сайту.
+            # Берём страну, контакты и спамблок; лимит цены у AutoBuy свой (обычно он уже поиска —
+            # поиск широкий для ручного выбора, AutoBuy только на дешёвые). При таком раскладе
+            # проверка и покупка идут одним запросом: цену AutoBuy отфильтрует сам.
             reg = self.current_settings(p)
-            for k in ("country", "contacts", "spam", "price_min", "price_max"):
+            for k in ("country", "contacts", "spam"):
                 if k in reg:
                     s[k] = reg[k]
             autobuy_reset(ab)
@@ -2041,7 +2082,7 @@ class Bot:
             if rt:
                 rt.rebuild()
             self.show_autobuy(p, chat_id, message_id, "main")
-            self.tg.answer_callback(cq_id, "Условия AutoBuy теперь как в поиске")
+            self.tg.answer_callback(cq_id, "Страна, контакты и спамблок взяты из поиска, лимит цены свой")
             return
         elif kind == "apply":
             self.apply_autobuy_settings(p, chat_id, message_id)
@@ -3210,7 +3251,7 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         if "lzt" in ab_sites:
             # AutoBuy идёт ПЕРЕД рассылкой: пока лоты уходят в чаты по секунде на каждый, их скупают.
             # Если условия AutoBuy совпадают с условиями поиска, второй запрос к сайту не нужен.
-            same = not error and lzt_params(p["query"]) == autobuy_lzt_params(ab_s)
+            same = not error and autobuy_can_reuse_lzt(lzt_params(p["query"]), autobuy_lzt_params(ab_s))
             bought = run_autobuy_site(bot, rt, ab, "lzt", items if same else None)
         if items:
             seen = p["seen"]["lzt"]
@@ -3236,7 +3277,7 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         error, rt.tron.last_error = rt.tron.last_error, None
         bought = set()
         if "tron" in ab_sites:
-            same = not error and (p.get("tron_filter") or "") == autobuy_tron_filter(ab_s)
+            same = not error and autobuy_can_reuse_tron(p.get("tron_filter") or "", autobuy_tron_filter(ab_s))
             bought = run_autobuy_site(bot, rt, ab, "tron", items if same else None)
         if items:
             seen = p["seen"]["tron"]
@@ -3351,16 +3392,16 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: l
         item_id = int(item["item_id"])
         key = f"{site}:{item_id}"
 
-        # 1) защита по цене — пропуск окончательный
+        # 1) защита по цене — пропуск окончательный. Проверяем сами, потому что список может быть
+        # общим с поиском, у которого ограничение по цене шире (или его нет вовсе)
         price = item.get("price")
-        if s.get("price_max") is not None and price is not None:
-            try:
-                if float(price) > float(s["price_max"]):
-                    skipped_price += 1
-                    done(item_id)
-                    continue
-            except (TypeError, ValueError):
-                pass
+        pv = _num(price)
+        if pv is not None:
+            lo, hi = _num(s.get("price_min")), _num(s.get("price_max"))
+            if (hi is not None and pv > hi) or (lo is not None and pv < lo):
+                skipped_price += 1
+                done(item_id)
+                continue
 
         # 2) покупаем
         if site == "lzt":

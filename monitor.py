@@ -62,6 +62,7 @@ TG_API = "https://api.telegram.org"
 DEFAULT_QUERY = "country[]=UZ&min_contacts=100&spam=no"
 DEFAULT_TRON_FILTER = "country=UZ contacts>=100 spam=no"
 MAX_SEEN_IDS = 5000
+MAX_BUY_ATTEMPTS = 5  # сколько раз пробовать купить лот при временных сбоях, прежде чем сдаться
 # Сортировка списка lzt. pdate_to_down — по исходной ДАТЕ ПУБЛИКАЦИИ, новые сверху: свежие заливы
 # видны, а заново поднятое старьё (старая дата публикации) наверх не лезет — это и нужно.
 # pdate_to_down_upload — по дате поднятия на маркет (как вкладка «новые» на сайте), тянет наверх
@@ -3056,7 +3057,8 @@ class Bot:
                     lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: запомнил {r.get('new', 0)} текущих лотов, покупаю следующие ({_ago(r['at'])})")
                 else:
                     lines.append(f"   {AUTOBUY_SITE_LABELS[site]}: новых {r.get('new', 0)}, куплено {r.get('bought', 0)}, "
-                                 f"не удалось {r.get('failed', 0)}, дороже лимита {r.get('skipped_price', 0)} ({_ago(r['at'])})")
+                                 f"не удалось {r.get('failed', 0)}, дороже лимита {r.get('skipped_price', 0)}"
+                                 + (f", повторю {r['retry']}" if r.get('retry') else "") + f" ({_ago(r['at'])})")
         lines.append("\nСтарые аккаунты учитываются в результатах. Уведомления приходят только о новых.")
         keyboard = {"inline_keyboard": [
             [{"text": "🔄 Обновить статус", "callback_data": "nav:status"}, {"text": "🔎 Проверить сейчас", "callback_data": "nav:check"}],
@@ -3243,6 +3245,18 @@ def run_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: list
         return set()
 
 
+def _buy_fail_kind(msg: str) -> str:
+    """Классификация неудачной покупки: permanent — лот уже не купить (продан/снят),
+    funds — не хватает денег (стоп до пополнения), transient — временный сбой, можно повторить."""
+    t = (msg or "").lower()
+    if any(w in t for w in ("продан", "куплен", "sold", "purchased", "не найден", "not found",
+                             "недоступен", "снят", "removed", "no longer", "уже нет")):
+        return "permanent"
+    if any(w in t for w in ("недостаточно", "не хватает", "insufficient", "баланс", "средств", "пополн")):
+        return "funds"
+    return "transient"
+
+
 def check_autobuy(bot: Bot, rt: UserRuntime) -> None:
     """Автопокупка новых лотов по отдельным условиям профиля (блок autobuy), на каждой
     из выбранных площадок. Первая проверка площадки после включения/смены фильтра — тихая:
@@ -3307,29 +3321,32 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: l
         return bought
 
     new_items.sort(key=lambda i: int(i.get("published_date") or 0))
-    skipped_price = failed = 0
-    for item in new_items:
-        item_id = int(item["item_id"])
+    fails = ab.setdefault("fails", {})       # ключ лота -> число неудачных попыток подряд
+    chats = rt.chats
+    skipped_price = failed = retry = 0
+
+    def done(item_id: int) -> None:
+        """Лот закрыт: успех, окончательный отказ или пропуск по цене — больше не трогаем."""
         seen.append(item_id)
         seen_set.add(item_id)
+        fails.pop(f"{site}:{item_id}", None)
 
-        # 1) защита по цене
+    for item in new_items:
+        item_id = int(item["item_id"])
+        key = f"{site}:{item_id}"
+
+        # 1) защита по цене — пропуск окончательный
         price = item.get("price")
         if s.get("price_max") is not None and price is not None:
             try:
                 if float(price) > float(s["price_max"]):
                     skipped_price += 1
+                    done(item_id)
                     continue
             except (TypeError, ValueError):
                 pass
 
-        # 2) анти-дребезг: не пытаемся купить один и тот же лот дважды в течение часа
-        attempt_key = f"{site}:{item_id}"
-        last = attempts.get(attempt_key)
-        if last and time.time() - last < 3600:
-            continue
-
-        # 3) покупаем
+        # 2) покупаем
         if site == "lzt":
             try:
                 price_int = int(price) if price is not None else None
@@ -3338,12 +3355,12 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: l
             ok, msg = client.fast_buy(item_id, price_int)
         else:
             ok, msg = client.buy(item_id)
-        attempts[attempt_key] = time.time()
+        attempts[key] = time.time()
         log.info("%s/autobuy %s: лот %d → %s (%s)", p["user_id"], label, item_id, ok, msg)
 
-        chats = rt.chats
         if ok:
             bought.add(item_id)
+            done(item_id)
             if chats:
                 bot.tg.send_all(chats, f"🤖✅ <b>AutoBuy</b> купил лот {item_id} на {label}.\n\n"
                                        + format_item(item))
@@ -3352,27 +3369,58 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: l
                 bot.send_account_files(rt, target, item_id, label, client=client)
             except Exception:
                 log.exception("autobuy: не удалось отправить файлы лота %d", item_id)
-        else:
-            failed += 1
-            if chats:
-                bot.tg.send_all(chats,
-                    f"🤖❌ <b>AutoBuy</b>: не удалось купить лот {item_id} на {label}.\n"
-                    f"Причина: {html.escape(user_error(msg))}\n"
-                    f"{item.get('url') or ''}")
+            ab.pop("funds_warned", None)
+            state.save()
+            continue
 
-        # урезаем массивы
-        if len(seen) > MAX_SEEN_IDS:
-            del seen[:-MAX_SEEN_IDS]
-        if len(attempts) > MAX_SEEN_IDS:
-            keep = sorted(attempts.items(), key=lambda kv: kv[1], reverse=True)[:MAX_SEEN_IDS]
-            ab["attempts"] = dict(keep)
-            attempts = ab["attempts"]
+        kind = _buy_fail_kind(msg)
+        if kind == "funds":
+            # Денег нет — остальные лоты этого захода тоже не купить. Стоп, лоты НЕ помечаем
+            # обработанными: попробуем снова после пополнения. Предупреждаем один раз.
+            if chats and not ab.get("funds_warned"):
+                bot.tg.send_all(chats, f"🤖💸 <b>AutoBuy</b>: не хватает средств на {label}, "
+                                       f"остановил покупки до пополнения баланса. ({html.escape(user_error(msg))})")
+                ab["funds_warned"] = True
+            log.warning("%s/autobuy %s: нет средств, стоп на этот заход", p["user_id"], site)
+            state.save()
+            break
+
+        if kind == "permanent":
+            failed += 1
+            done(item_id)
+            if chats:
+                bot.tg.send_all(chats, f"🤖❌ <b>AutoBuy</b>: лот {item_id} на {label} уже не купить: "
+                                       f"{html.escape(user_error(msg))}")
+            state.save()
+            continue
+
+        # transient — временный сбой: повторим на следующих проверках, до MAX_BUY_ATTEMPTS
+        fails[key] = fails.get(key, 0) + 1
+        if fails[key] >= MAX_BUY_ATTEMPTS:
+            failed += 1
+            done(item_id)
+            if chats:
+                bot.tg.send_all(chats, f"🤖❌ <b>AutoBuy</b>: лот {item_id} на {label} не удалось купить за "
+                                       f"{MAX_BUY_ATTEMPTS} попыток: {html.escape(user_error(msg))}\n{item.get('url') or ''}")
+        else:
+            retry += 1  # оставляем не помеченным — попробуем ещё на следующем цикле
+            log.info("%s/autobuy %s: лот %d, попытка %d/%d, повторю позже",
+                     p["user_id"], site, item_id, fails[key], MAX_BUY_ATTEMPTS)
         state.save()
 
-    _ab_report(rt, site, new=len(new_items), bought=len(bought), failed=failed, skipped_price=skipped_price)
+    # урезаем массивы
+    if len(seen) > MAX_SEEN_IDS:
+        del seen[:-MAX_SEEN_IDS]
+    if len(attempts) > MAX_SEEN_IDS:
+        keep = sorted(attempts.items(), key=lambda kv: kv[1], reverse=True)[:MAX_SEEN_IDS]
+        ab["attempts"] = dict(keep)
+    state.save()
+
+    _ab_report(rt, site, new=len(new_items), bought=len(bought), failed=failed,
+               skipped_price=skipped_price, retry=retry)
     if new_items:
-        log.info("%s/autobuy %s: новых %d, куплено %d, не удалось %d, дороже лимита %d",
-                 p["user_id"], site, len(new_items), len(bought), failed, skipped_price)
+        log.info("%s/autobuy %s: новых %d, куплено %d, не удалось %d, дороже лимита %d, повторю %d",
+                 p["user_id"], site, len(new_items), len(bought), failed, skipped_price, retry)
     return bought
 
 

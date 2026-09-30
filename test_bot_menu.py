@@ -476,3 +476,49 @@ class TronPaginationTests(unittest.TestCase):
                  3: {"data": [{"id": 5}]}}
         items = self._client(pages, 2).fetch_items()
         self.assertEqual(sorted(i["item_id"] for i in items), [1, 2, 3, 4])
+
+
+class AutobuyBehaviorTests(unittest.TestCase):
+    """Автопокупка сразу берёт подходящие лоты с витрины и показывает отказы."""
+
+    def setUp(self):
+        self.p = {"user_id": 1, "chats": [10], "category": "telegram", "query": "", "tron_filter": "",
+                  "seen": {"lzt": [], "tron": []}, "init": {"lzt": False, "tron": False}}
+        self.tg = Mock()
+        self.state = SimpleNamespace(save=Mock())
+        self.cfg = SimpleNamespace(lzt_pages=3, tron_pages=3)
+        self.bot = SimpleNamespace(state=self.state, tg=self.tg, cfg=self.cfg, send_account_files=Mock())
+        self.client = Mock()
+        self.client.last_error = None
+        self.rt = SimpleNamespace(profile=self.p, lzt_ab=self.client, tron_ab=None, stats={}, chats=[10])
+        self.ab = {"enabled": True, "sources": ["lzt"],
+                   "settings": {"country": "any", "contacts": 0, "spam": "any", "origins": [],
+                                "price_min": None, "price_max": None},
+                   "seen": {"lzt": [], "tron": []}, "init": {"lzt": False, "tron": False}, "attempts": {}}
+
+    def test_buys_existing_lots_on_first_run(self):
+        self.client.fetch_items.return_value = [
+            {"item_id": 111, "price": 10, "published_date": 1},
+            {"item_id": 112, "price": 20, "published_date": 2}]
+        self.client.fast_buy.return_value = (True, "ok")
+        bought = monitor._check_autobuy_site(self.bot, self.rt, self.ab, "lzt", None)
+        self.assertEqual(bought, {111, 112})  # больше не пропускаем витрину тихо
+        self.assertTrue(self.ab["init"]["lzt"])
+
+    def test_transient_failure_is_reported_and_retried(self):
+        self.client.fetch_items.return_value = [{"item_id": 200, "price": 10, "published_date": 1}]
+        self.client.fast_buy.return_value = (False, "временный сбой сети")
+        monitor._check_autobuy_site(self.bot, self.rt, self.ab, "lzt", None)
+        msgs = [c.args[1] for c in self.tg.send_all.call_args_list]
+        self.assertTrue(any("пока не куплен" in m for m in msgs))  # видно с первой неудачи
+        self.assertNotIn(200, self.ab["seen"]["lzt"])              # оставлен на повтор
+        self.assertIn("last_fail", self.rt.stats["ab_lzt"])
+
+    def test_price_over_limit_is_skipped(self):
+        self.ab["settings"]["price_max"] = 15
+        self.client.fetch_items.return_value = [{"item_id": 300, "price": 50, "published_date": 1}]
+        self.client.fast_buy.return_value = (True, "ok")
+        bought = monitor._check_autobuy_site(self.bot, self.rt, self.ab, "lzt", None)
+        self.assertEqual(bought, set())
+        self.client.fast_buy.assert_not_called()
+        self.assertIn(300, self.ab["seen"]["lzt"])

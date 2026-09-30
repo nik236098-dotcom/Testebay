@@ -117,7 +117,8 @@ class Config:
         self.query = os.getenv("LZT_QUERY", DEFAULT_QUERY).strip().lstrip("?")
         self.tron_token = os.getenv("TRON_TOKEN", "").strip()
         self.tron_filter = os.getenv("TRON_FILTER", DEFAULT_TRON_FILTER).strip()
-        self.tron_pages = max(1, int(os.getenv("TRON_PAGES", "2")))
+        self.tron_pages = max(1, int(os.getenv("TRON_PAGES", "3")))
+        self.lzt_pages = max(1, int(os.getenv("LZT_PAGES", "3")))
         self.tron_category = os.getenv("TRON_CATEGORY", "telegram").strip() or "telegram"
         # Общее
         self.poll_interval = max(5, int(os.getenv("POLL_INTERVAL", "60")))
@@ -489,8 +490,38 @@ class LztClient:
             log.warning("Не удалось получить баланс lzt: %s", exc)
             return user_error(exc)
 
-    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
-        """retries=1 — один быстрый запрос без пауз (для команд из чата), 5 — с повторами (для монитора)."""
+    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5,
+                    max_pages: int = 1, stop_ids=None) -> list[dict]:
+        """Список лотов. max_pages>1 — перелистываем страницы, пока не дойдём до уже виденных
+        (stop_ids) или до пустой/последней страницы. Так крупный залив за интервал опроса не
+        теряется: новые лоты со 2-й и дальше страниц тоже попадают в выдачу.
+        retries=1 — один быстрый запрос без пауз (для команд из чата), 5 — с повторами."""
+        base = [(k, v) for (k, v) in params if k != "page"]
+        collected: dict[int, dict] = {}
+        first_size = None
+        for page in range(1, max(1, max_pages) + 1):
+            page_params = base + ([("page", str(page))] if page > 1 else [])
+            page_items = self._fetch_page(category, page_params, retries)
+            if not page_items:
+                break  # пусто или ошибка — глубже не идём
+            hit_seen = False
+            for it in page_items:
+                iid = it.get("item_id")
+                if iid is None:
+                    continue
+                collected.setdefault(int(iid), it)
+                if stop_ids and int(iid) in stop_ids:
+                    hit_seen = True
+            if hit_seen:
+                break  # дошли до уже виденных лотов — дальше только более старые
+            if first_size is None:
+                first_size = len(page_items)
+            elif len(page_items) < first_size:
+                break  # неполная страница — это последняя
+        return list(collected.values())
+
+    def _fetch_page(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
+        """Одна страница выдачи с повторами при временных сбоях."""
         url = f"{API_BASE}/{category}"
         backoff = 5
         for attempt in range(1, retries + 1):
@@ -594,7 +625,9 @@ class WebClient:
         self.last_error: str | None = None
         self.last_meta: dict = {}
 
-    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5) -> list[dict]:
+    def fetch_items(self, category: str, params: list[tuple[str, str]], retries: int = 5,
+                    max_pages: int = 1, stop_ids=None) -> list[dict]:
+        # Режим страницы без API читает только видимую страницу сайта; постранично не листаем.
         try:
             return fetch_items_web(category, urlencode(params), self.cookies, self.use_browser, self.session)
         except (WebSourceError, requests.RequestException) as exc:
@@ -638,9 +671,9 @@ class TronClient:
             return False, "Пустой ответ /me"
         return True, f"{display_value(user.get('username'), 'пользователь')}, баланс {display_value(user.get('balance'), 'недоступен')} {str(user.get('currency') or '').upper()}"
 
-    def fetch_items(self, retries: int = 5) -> list[dict]:
+    def fetch_items(self, retries: int = 5, stop_ids=None) -> list[dict]:
         try:
-            items = self.api.fetch_items(self.params, retries=retries)
+            items = self.api.fetch_items(self.params, retries=retries, stop_ids=stop_ids)
         except (TronError, requests.RequestException) as exc:
             self.last_error = str(exc)[:300]
             log.error("%s", exc)
@@ -652,7 +685,7 @@ class TronClient:
 
     def fetch_raw_sample(self) -> tuple[dict | None, int]:
         data = self.api.fetch_raw_page(1, self.params, retries=1)
-        raw = data.get("items") if isinstance(data, dict) else data
+        raw = (data.get("items") or data.get("data")) if isinstance(data, dict) else data
         raw = raw if isinstance(raw, list) else []
         return (raw[0] if raw else (data if isinstance(data, dict) else None)), len(raw)
 
@@ -3299,7 +3332,8 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
     ab_s = (ab.get("settings") or dict(AUTOBUY_DEFAULT_SETTINGS)) if ab else {}
 
     if rt.lzt is not None:
-        items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]))
+        items = rt.lzt.fetch_items(p["category"], lzt_params(p["query"]),
+                                   max_pages=bot.cfg.lzt_pages, stop_ids=set(p["seen"]["lzt"]))
         st["checks"] += 1
         st["last_check_at"] = time.time()
         st["last_items"] = len(items)
@@ -3328,7 +3362,7 @@ def _check_user(bot: Bot, rt: UserRuntime) -> None:
         run_autobuy_site(bot, rt, ab, "lzt", None)
 
     if rt.tron is not None:
-        items = rt.tron.fetch_items()
+        items = rt.tron.fetch_items(stop_ids=set(p["seen"]["tron"]))
         st["tron_total"] = rt.tron.last_total
         st["tron_items"] = len(items)
         st["tron_new"] = 0
@@ -3408,13 +3442,14 @@ def _check_autobuy_site(bot: Bot, rt: UserRuntime, ab: dict, site: str, items: l
                 _ab_report(rt, site, error="нет токена lzt.market или включён режим страницы")
                 return bought
             items = client.fetch_items(p.get("category") or "telegram",
-                                       autobuy_lzt_params(s), retries=2)
+                                       autobuy_lzt_params(s), retries=2,
+                                       max_pages=bot.cfg.lzt_pages, stop_ids=seen_set)
         else:
             client = rt.tron_ab
             if client is None:
                 _ab_report(rt, site, error="нет токена tronaccs")
                 return bought
-            items = client.fetch_items(retries=2)
+            items = client.fetch_items(retries=2, stop_ids=seen_set)
         if client.last_error:
             log.warning("%s/autobuy %s: %s", p["user_id"], site, client.last_error)
             _ab_report(rt, site, error=user_error(client.last_error))

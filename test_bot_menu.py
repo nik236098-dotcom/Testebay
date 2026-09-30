@@ -410,3 +410,69 @@ class TronNestedApiTests(unittest.TestCase):
         from tron_source import normalize
         self.assertEqual(normalize({"id": 1, "price": 1, "item_origin": "brute"})["item_origin"], "brute")
         self.assertIsNone(normalize({"id": 1, "price": 1})["item_origin"])
+
+
+class LztPaginationTests(unittest.TestCase):
+    """lzt перелистывает страницы, пока не дойдёт до уже виденных лотов."""
+
+    def _client(self, pages):
+        c = monitor.LztClient("t")
+        def fake(category, params, retries=5):
+            page = 1
+            for k, v in params:
+                if k == "page":
+                    page = int(v)
+            return pages.get(page, [])
+        c._fetch_page = fake
+        return c
+
+    def test_collects_multiple_pages(self):
+        pages = {1: [{"item_id": i} for i in (1, 2, 3)],
+                 2: [{"item_id": i} for i in (4, 5, 6)], 3: []}
+        items = self._client(pages).fetch_items("telegram", [("order_by", "x")], max_pages=3)
+        self.assertEqual(sorted(i["item_id"] for i in items), [1, 2, 3, 4, 5, 6])
+
+    def test_stops_when_seen_lot_appears(self):
+        pages = {1: [{"item_id": 10}, {"item_id": 11}],
+                 2: [{"item_id": 12}, {"item_id": 5}],
+                 3: [{"item_id": 99}]}
+        items = self._client(pages).fetch_items("telegram", [("order_by", "x")], max_pages=5, stop_ids={5})
+        ids = [i["item_id"] for i in items]
+        self.assertIn(12, ids)
+        self.assertNotIn(99, ids)  # 3-ю страницу уже не запрашиваем
+
+    def test_default_is_single_page(self):
+        pages = {1: [{"item_id": 1}], 2: [{"item_id": 2}]}
+        items = self._client(pages).fetch_items("telegram", [("order_by", "x")])
+        self.assertEqual([i["item_id"] for i in items], [1])
+
+    def test_short_page_is_last(self):
+        pages = {1: [{"item_id": 1}, {"item_id": 2}], 2: [{"item_id": 3}], 3: [{"item_id": 4}]}
+        items = self._client(pages).fetch_items("telegram", [("order_by", "x")], max_pages=3)
+        self.assertEqual(sorted(i["item_id"] for i in items), [1, 2, 3])
+
+
+class TronPaginationTests(unittest.TestCase):
+    """tronaccs листает до уже виденных лотов и не превышает лимит страниц."""
+
+    def _client(self, pages, max_pages):
+        from tron_source import TronApiClient
+        c = TronApiClient("x", "telegram", max_pages)
+        c.fetch_raw_page = lambda page, params, retries=5: pages.get(page, {"data": []})
+        return c
+
+    def test_stops_when_seen_lot_appears(self):
+        pages = {1: {"data": [{"id": 10}, {"id": 11}]},
+                 2: {"data": [{"id": 12}, {"id": 5}]},
+                 3: {"data": [{"id": 99}]}}
+        items = self._client(pages, 5).fetch_items(stop_ids={5})
+        ids = [i["item_id"] for i in items]
+        self.assertIn(12, ids)
+        self.assertNotIn(99, ids)
+
+    def test_respects_page_cap(self):
+        pages = {1: {"data": [{"id": 1}, {"id": 2}]},
+                 2: {"data": [{"id": 3}, {"id": 4}]},
+                 3: {"data": [{"id": 5}]}}
+        items = self._client(pages, 2).fetch_items()
+        self.assertEqual(sorted(i["item_id"] for i in items), [1, 2, 3, 4])

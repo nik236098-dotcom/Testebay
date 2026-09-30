@@ -452,8 +452,10 @@ class TronApiClient:
         q.update(params or {})
         return self._request("GET", "/items", params=q, retries=retries)
 
-    def fetch_items(self, params: dict | None = None, retries: int = 5) -> list[dict]:
-        """Лоты, новые первыми, с первых max_pages страниц. retries=1 — без ожидания при лимите запросов."""
+    def fetch_items(self, params: dict | None = None, retries: int = 5, stop_ids=None) -> list[dict]:
+        """Лоты, новые первыми, с первых max_pages страниц. Если на странице встретился уже
+        виденный лот (stop_ids), дальше не листаем — там только более старое. Так крупный залив
+        за интервал опроса не теряется. retries=1 — без ожидания при лимите запросов."""
         items: dict[int, dict] = {}
         page_size = None
         for page in range(1, self.max_pages + 1):
@@ -463,11 +465,16 @@ class TronApiClient:
             raw_list = (data.get("items") or data.get("data")) if isinstance(data, dict) else data
             if not isinstance(raw_list, list) or not raw_list:
                 break
+            hit_seen = False
             for raw in raw_list:
                 if isinstance(raw, dict):
                     item = normalize(raw)
                     if item:
                         items[item["item_id"]] = item
+                        if stop_ids and item["item_id"] in stop_ids:
+                            hit_seen = True
+            if hit_seen:
+                break  # дошли до уже виденных лотов — глубже только старое
             page_size = page_size or len(raw_list)
             if len(raw_list) < page_size:
                 break

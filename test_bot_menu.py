@@ -198,3 +198,48 @@ class LabelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OriginTests(unittest.TestCase):
+    """Происхождение аккаунта печатается для лотов обеих площадок."""
+
+    def test_lzt_code_is_translated(self):
+        text = monitor.format_item({"item_id": 1, "price": 10, "item_origin": "brute"})
+        self.assertIn("📦 Происхождение: брут", text)
+
+    def test_lzt_phrase_used_when_code_unknown(self):
+        text = monitor.format_item({"item_id": 1, "price": 10, "item_origin": "something_new",
+                                    "itemOriginPhrase": "Новый тип"})
+        self.assertIn("📦 Происхождение: Новый тип", text)
+
+    def test_lzt_phrase_only(self):
+        text = monitor.format_item({"item_id": 1, "price": 10, "itemOriginPhrase": "Брут"})
+        self.assertIn("📦 Происхождение: Брут", text)
+
+    def test_lzt_resale_shows_original_origin(self):
+        text = monitor.format_item({"item_id": 1, "price": 10, "item_origin": "resale", "resale_item_origin": "stealer"})
+        self.assertIn("📦 Происхождение: перепродажа (стилер)", text)
+
+    def test_tron_origin_under_other_keys(self):
+        from tron_source import normalize
+        for raw, expected in (
+            ({"item_id": 5, "price": 1, "origin": "autoreg"}, "авторег"),
+            ({"item_id": 5, "price": 1, "origin_name": "Брут"}, "Брут"),
+            ({"item_id": 5, "price": 1, "origin": {"id": 3, "name": "stealer"}}, "стилер"),
+            ({"item_id": 5, "price": 1, "origin_id": 7}, "ID 7"),
+            ({"item_id": 5, "price": 1, "accountOrigin": "personal"}, "личный"),
+            ({"item_id": 5, "price": 1, "original_price": 99, "origin": "farm"}, "ферма"),
+        ):
+            with self.subTest(raw=raw):
+                item = normalize(raw)
+                self.assertIn(f"📦 Происхождение: {expected}", monitor.format_item(item))
+                self.assertIn("🏪 tronaccs", monitor.format_item(item))
+
+    def test_no_origin_no_line(self):
+        from tron_source import normalize
+        self.assertNotIn("Происхождение", monitor.format_item({"item_id": 1, "price": 10}))
+        self.assertNotIn("Происхождение", monitor.format_item(normalize({"item_id": 5, "price": 1, "item_origin": ""})))
+
+    def test_origin_is_html_escaped(self):
+        text = monitor.format_item({"item_id": 1, "price": 10, "item_origin": "<b>x</b>"})
+        self.assertIn("📦 Происхождение: &lt;b&gt;x&lt;/b&gt;", text)

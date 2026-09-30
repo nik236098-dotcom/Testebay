@@ -12,6 +12,8 @@ tronaccs.market через System API v2 (https://tronaccs-market.readme.io).
 price_currency, price_fees, telegram_counrty (код страны, опечатка в API),
 telegram_contacts_count, telegram_spam_block, telegram_premium, telegram_channels_count,
 telegram_conversations_count, telegram_password (2FA), ...}]}
+Происхождение аккаунта в ответе может лежать под разными ключами (item_origin, origin,
+origin_name, вложенный объект или числовой ID) — см. _origin().
 
 Фильтр пользователя (строка вида "country=UZ contacts>=100 spam=no price<=500")
 разбирается в parse_filter; то, что умеет сервер, уходит параметрами запроса
@@ -218,6 +220,29 @@ def _to_ts(value) -> int | None:
     return int(dt.timestamp())
 
 
+ORIGIN_KEYS = ("item_origin", "origin", "origin_name", "origin_title", "item_origin_name", "account_origin")
+
+
+def _origin(raw: dict):
+    """Происхождение аккаунта из ответа tronaccs: поле может называться по-разному и быть
+    строкой, числовым ID (как в фильтре origin=<ID>) или вложенным объектом {id, name}.
+    Возвращаем название, если оно есть, иначе ID; None — если ничего не нашли."""
+    candidates = [raw.get(k) for k in ORIGIN_KEYS if k in raw]
+    candidates += [v for k, v in raw.items()
+                   if "origin" in k.lower() and "original" not in k.lower() and k not in ORIGIN_KEYS]
+    for value in candidates:
+        if isinstance(value, dict):
+            named = value.get("name") or value.get("title") or value.get("slug") or value.get("code")
+            if named not in (None, ""):
+                return str(named)
+            if value.get("id") not in (None, ""):
+                return value.get("id")
+            continue
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
 def normalize(raw: dict) -> dict | None:
     """Приводим лот tronaccs к виду лота lzt, чтобы форматирование и кнопки были общими."""
     try:
@@ -236,7 +261,7 @@ def normalize(raw: dict) -> dict | None:
         "published_date": _to_ts(raw.get("published_date")),
         "url": raw.get("item_url") or f"{TRON_SITE}/{raw.get('category') or 'telegram'}/{item_id}",
         "source": "tron",
-        "item_origin": raw.get("item_origin"),
+        "item_origin": _origin(raw),
         "seller_username": raw.get("seller_username"),
         "raw": raw,
     }

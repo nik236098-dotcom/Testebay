@@ -848,6 +848,42 @@ ORIGIN_LABELS = {
 }
 
 
+def _origin_label(value) -> str:
+    """Код или название происхождения -> текст по-русски; незнакомое значение показываем как есть."""
+    if isinstance(value, dict):
+        value = _first(value, "name", "title", "phrase", "label", "slug", "code", "value", "id")
+    if value in (None, "", [], {}):
+        return ""
+    text = str(value).strip()
+    return ORIGIN_LABELS.get(text.lower(), text)
+
+
+def origin_text(item: dict) -> str:
+    """Происхождение аккаунта одной строкой, общее для обеих площадок.
+
+    lzt.market отдаёт код в item_origin ("brute", "stealer", ...), готовую фразу в
+    itemOriginPhrase и, для перепродажи, исходное происхождение в resale_item_origin.
+    tronaccs после normalize кладёт то, что нашёл (название или ID), в item_origin.
+    Нет ни одного поля — пустая строка, строка в сообщении не печатается."""
+    code = _first(item, "item_origin", "origin", "origin_name", "origin_title", "account_origin")
+    phrase = _first(item, "itemOriginPhrase", "item_origin_phrase", "origin_phrase")
+    label = _origin_label(code)
+    if label and label == str(code).strip() and phrase:
+        # код без перевода в нашем словаре — берём фразу площадки, она уже человекочитаемая
+        label = str(phrase).strip()
+    if not label:
+        label = _origin_label(phrase)
+    if not label:
+        return ""
+    if str(code or "").strip().lower() == "resale":
+        base = _origin_label(_first(item, "resale_item_origin"))
+        if base:
+            label = f"{label} ({base})"
+    if label.isdigit():
+        label = f"ID {label}"  # площадка отдала только числовой код без справочника
+    return label
+
+
 def _first(item: dict, *keys: str):
     for key in keys:
         value = item.get(key)
@@ -1281,9 +1317,9 @@ def format_item(item: dict) -> str:
     details = _first(item, "web_details")
     if details:
         lines.append(f"ℹ️ {html.escape(str(details))}")
-    origin = _first(item, "item_origin")
+    origin = origin_text(item)
     if origin:
-        lines.append(f"📦 Происхождение: {html.escape(ORIGIN_LABELS.get(str(origin).lower(), str(origin)))}")
+        lines.append(f"📦 Происхождение: {html.escape(origin)}")
     seller = _first(item, "seller_username")
     if seller:
         lines.append(f"👤 Продавец: {html.escape(str(seller))}")

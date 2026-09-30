@@ -34,6 +34,12 @@ def origin_name(code):
     return "любое" if code == "any" else ORIGINS.get(code, code)
 
 
+def origins_line(codes):
+    """Список кодов происхождения -> строка для показа; пусто -> 'не имеет значения'."""
+    codes = [c for c in (codes or []) if c and c != "any"]
+    return ", ".join(origin_name(c) for c in codes) if codes else "не имеет значения"
+
+
 def number(value):
     try:
         n = Decimal(str(value))
@@ -66,8 +72,10 @@ def price_text(settings):
 def criteria(settings):
     contacts = settings.get("contacts", 0)
     spam = {"no": "только без спамблока", "yes": "только со спамблоком", "any": "не имеет значения"}.get(settings.get("spam"), "не имеет значения")
-    origin = settings.get("origin") or "any"
-    origin_line = "не имеет значения" if origin == "any" else origin_name(origin)
+    origins = settings.get("origins")
+    if origins is None and settings.get("origin") not in (None, "", "any"):
+        origins = [settings["origin"]]
+    origin_line = origins_line(origins)
     return "\n".join([
         "🌍 Страна: " + country_name(settings.get("country")),
         "👥 Контакты: " + ("не меньше " + number(contacts) if contacts else "без ограничений"),
@@ -91,7 +99,7 @@ def settings_from_query(query):
             return default
     return {"country": first("country[]", "any") or "any", "contacts": numeric("min_contacts", 0),
             "spam": first("spam") if first("spam") in ("yes", "no") else "any",
-            "origin": (first("origin[]", "any") or "any").lower(),
+            "origins": [o.lower() for o in q.get("origin[]", []) if o and o.lower() != "any"],
             "price_min": numeric("pmin"), "price_max": numeric("pmax")}
 
 
@@ -128,7 +136,7 @@ def tron_criteria(rules):
         elif canonical == "spam":
             rendered = {"no": "без спамблока", "false": "без спамблока", "0": "без спамблока", "yes": "со спамблоком", "true": "со спамблоком", "1": "со спамблоком"}.get(str(value).lower(), "неизвестное значение")
         elif canonical == "origin":
-            rendered = origin_name(value)
+            rendered = origins_line(str(value).split(","))
         elif canonical == "price":
             rendered = money(value)
         elif canonical in ("contacts", "dialogs", "channels", "chats"):

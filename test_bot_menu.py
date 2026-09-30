@@ -274,47 +274,71 @@ class OriginSettingTests(unittest.TestCase):
     def test_criteria_shows_origin_line(self):
         self.assertIn("📦 Происхождение: не имеет значения", criteria(settings_from_query(self.p["query"])))
 
-    def test_query_origin_is_parsed_and_named(self):
-        s = settings_from_query("country[]=UZ&origin[]=brute")
-        self.assertEqual(s["origin"], "brute")
-        self.assertIn("📦 Происхождение: брут", criteria(s))
+    def test_query_origins_parsed_and_named(self):
+        s = settings_from_query("country[]=UZ&origin[]=brute&origin[]=dummy")
+        self.assertEqual(s["origins"], ["brute", "dummy"])
+        self.assertIn("📦 Происхождение: брут, пустышка", criteria(s))
 
-    def test_pick_origin_updates_settings(self):
+    def test_pick_two_origins_accumulates(self):
+        self.bot.current_settings(self.p)
+        self._cb(['set', 'origin', 'autoreg'])
+        self._cb(['set', 'origin', 'dummy'])
+        self.assertEqual(self.p['settings']['origins'], ['autoreg', 'dummy'])
+        self.assertIn('авторег, пустышка', self.tg.edit_text.call_args.args[2])
+
+    def test_pick_same_origin_twice_toggles_off(self):
         self.bot.current_settings(self.p)
         self._cb(['set', 'origin', 'stealer'])
-        self.assertEqual(self.p['settings']['origin'], 'stealer')
-        self.assertIn('стилер', self.tg.edit_text.call_args.args[2])
+        self._cb(['set', 'origin', 'stealer'])
+        self.assertEqual(self.p['settings']['origins'], [])
 
-    def test_any_origin_clears(self):
+    def test_any_origin_clears_all(self):
         self.bot.current_settings(self.p)
-        self.p['settings']['origin'] = 'brute'
+        self.p['settings']['origins'] = ['brute', 'dummy']
         self._cb(['set', 'origin', 'any'])
-        self.assertEqual(self.p['settings']['origin'], 'any')
+        self.assertEqual(self.p['settings']['origins'], [])
 
-    def test_apply_writes_origin_to_both_filters(self):
+    def test_legacy_single_origin_is_migrated(self):
+        self.bot.current_settings(self.p)
+        self.p['settings'].pop('origins', None)
+        self.p['settings']['origin'] = 'brute'
+        self._cb(['set', 'origin', 'dummy'])
+        self.assertEqual(self.p['settings']['origins'], ['brute', 'dummy'])
+        self.assertNotIn('origin', self.p['settings'])
+
+    def test_apply_writes_multiple_origins_to_both_filters(self):
         self.bot.show_menu(self.p, 10)
         s = self.bot.current_settings(self.p)
-        s['origin'] = 'brute'
+        s['origins'] = ['autoreg', 'dummy']
         self.bot.apply_settings(self.p, 10)
-        self.assertIn('origin[]=brute', self.p['query'])
-        self.assertIn('origin=brute', self.p['tron_filter'])
+        self.assertIn('origin[]=autoreg', self.p['query'])
+        self.assertIn('origin[]=dummy', self.p['query'])
+        self.assertIn('origin=autoreg,dummy', self.p['tron_filter'])
 
-    def test_apply_any_origin_leaves_filters_clean(self):
+    def test_apply_no_origin_leaves_filters_clean(self):
         self.bot.show_menu(self.p, 10)
         self.bot.apply_settings(self.p, 10)
         self.assertNotIn('origin', self.p['query'])
         self.assertNotIn('origin', self.p['tron_filter'])
 
-    def test_origin_not_flagged_as_link_extra(self):
-        text = lzt_criteria("country[]=UZ&origin[]=brute")
+    def test_origins_not_flagged_as_link_extra(self):
+        text = lzt_criteria("country[]=UZ&origin[]=brute&origin[]=dummy")
         self.assertNotIn("Дополнительные условия", text)
 
-    def test_autobuy_origin_in_params_and_filter(self):
+    def test_tron_filter_matches_any_of_several_origins(self):
+        from tron_source import normalize, match_filter, parse_filter
+        it = normalize({"id": 1, "price": 1, "item_origin": {"type": "stealer", "title": "Стиллер"}})
+        self.assertTrue(match_filter(it, parse_filter("origin=autoreg,stealer")))
+        self.assertFalse(match_filter(it, parse_filter("origin=autoreg,dummy")))
+
+    def test_autobuy_multiple_origins_in_params_and_filter(self):
         from monitor import autobuy_lzt_params, autobuy_tron_filter
-        s = {"country": "any", "contacts": 0, "spam": "any", "origin": "stealer",
+        s = {"country": "any", "contacts": 0, "spam": "any", "origins": ["stealer", "brute"],
              "price_min": None, "price_max": None}
-        self.assertIn(("origin[]", "stealer"), autobuy_lzt_params(s))
-        self.assertIn("origin=stealer", autobuy_tron_filter(s))
+        params = autobuy_lzt_params(s)
+        self.assertIn(("origin[]", "stealer"), params)
+        self.assertIn(("origin[]", "brute"), params)
+        self.assertIn("origin=stealer,brute", autobuy_tron_filter(s))
 
 
 class TronNestedApiTests(unittest.TestCase):

@@ -179,10 +179,11 @@ def _to_number(value):
 def _match_rule(item: dict, key: str, op: str, expected: str) -> bool:
     if key in ("origin", "происхождение"):
         actual = canon_origin(item.get("item_origin"))
-        exp = canon_origin(expected)
         if not actual:
-            return False
-        return (actual == exp) if op != "!=" else (actual != exp)
+            return op == "!="  # происхождение неизвестно: "не равно" верно, "равно" — нет
+        wanted = {canon_origin(x) for x in str(expected).split(",") if x.strip()}
+        hit = actual in wanted
+        return hit if op != "!=" else not hit
     real_key = _find_key(item, key)
     if real_key is None:
         return False

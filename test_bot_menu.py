@@ -373,6 +373,15 @@ class TronNestedApiTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["item_origin"], "phish")
 
+    def test_confirmed_tron_origin_types(self):
+        from tron_source import normalize, match_filter, parse_filter
+        for type_, picker, ru in (("phish", "fishing", "фишинг"), ("stealer", "stealer", "стилер")):
+            raw = dict(self.SAMPLE, item_origin={"id": 0, "type": type_, "title": "x"})
+            it = normalize(raw)
+            with self.subTest(type=type_):
+                self.assertIn(f"\U0001F4E6 Происхождение: {ru}", monitor.format_item(it))
+                self.assertTrue(match_filter(it, parse_filter(f"origin={picker}")))
+
     def test_scalar_and_missing_origin_still_work(self):
         from tron_source import normalize
         self.assertEqual(normalize({"id": 1, "price": 1, "item_origin": "brute"})["item_origin"], "brute")

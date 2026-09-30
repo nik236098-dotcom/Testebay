@@ -41,7 +41,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 import requests
 
 from bot_text import display_value, readable, split_html, user_error
-from bot_menu import country_name, criteria, lzt_criteria, money, price_text, settings_from_query, tron_criteria
+from bot_menu import country_name, criteria, lzt_criteria, money, origin_name, price_text, settings_from_query, tron_criteria
 
 from tron_source import TronApiClient, TronError, build_params, match_filter, parse_filter
 from web_source import WebSourceError, fetch_items_web
@@ -179,6 +179,8 @@ def autobuy_lzt_params(s: dict) -> list[tuple[str, str]]:
         params.append(("min_contacts", str(s["contacts"])))
     if s.get("spam") and s["spam"] != "any":
         params.append(("spam", s["spam"]))
+    if s.get("origin", "any") != "any":
+        params.append(("origin[]", s["origin"]))
     if s.get("price_min") is not None:
         params.append(("pmin", str(s["price_min"])))
     if s.get("price_max") is not None:
@@ -196,6 +198,8 @@ def autobuy_tron_filter(s: dict) -> str:
         parts.append(f"contacts>={s['contacts']}")
     if s.get("spam") and s["spam"] != "any":
         parts.append(f"spam={s['spam']}")
+    if s.get("origin", "any") != "any":
+        parts.append(f"origin={s['origin']}")
     if s.get("price_min") is not None:
         parts.append(f"price>={s['price_min']}")
     if s.get("price_max") is not None:
@@ -207,6 +211,7 @@ AUTOBUY_DEFAULT_SETTINGS = {
     "country": "UZ",
     "contacts": 100,
     "spam": "no",
+    "origin": "any",
     "price_min": None,
     "price_max": None,
     "lzt": True,
@@ -1428,6 +1433,7 @@ class Bot:
     COUNTRIES = ["UZ", "RU", "KZ", "UA", "BY", "KG", "TJ", "US", "IN", "ID"]
     CONTACTS = [0, 50, 100, 200, 300, 500, 1000]
     PRICES = [100, 200, 300, 500, 1000, 2000]
+    ORIGINS = ["brute", "stealer", "fishing", "autoreg", "personal", "resale", "retrive", "dummy"]
 
     def __init__(self, cfg: Config, state: State, tg: Telegram) -> None:
         self.cfg = cfg
@@ -1667,12 +1673,24 @@ class Bot:
                 [{"text": ("✅ " if lo is None and hi is None else "") + "Любая цена", "callback_data": "set:price_clear:0"},
                  {"text": "← Назад", "callback_data": "set:menu:0"}],
             ]}
+        if view == "origin":
+            rows, row = [], []
+            for c in self.ORIGINS:
+                row.append({"text": ("✅ " if s.get("origin", "any") == c else "") + origin_name(c), "callback_data": f"set:origin:{c}"})
+                if len(row) == 2:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append([{"text": ("✅ " if s.get("origin", "any") == "any" else "") + "Любое", "callback_data": "set:origin:any"}])
+            rows.append([{"text": "← Назад", "callback_data": "set:menu:0"}])
+            return {"inline_keyboard": rows}
         country = country_name(s["country"])
         spam = {"no": "нет", "yes": "есть", "any": "любой"}[s["spam"]]
         return {"inline_keyboard": [
             [{"text": f"🌍 Страна: {country}", "callback_data": "set:view:country"}],
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "set:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "set:view:spam"}],
+            [{"text": f"📦 Происхождение: {origin_name(s.get('origin', 'any'))}", "callback_data": "set:view:origin"}],
             [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "set:view:price"}],
             [{"text": ("✅" if s.get("lzt", True) else "☐") + " lzt.market", "callback_data": "set:site:lzt"},
              {"text": ("✅" if s.get("tron", True) else "☐") + " tronaccs", "callback_data": "set:site:tron"}],
@@ -1685,6 +1703,8 @@ class Bot:
         hints = {"main": "\n\nНажмите на строку, чтобы изменить. Затем нажмите «Сохранить условия».",
                  "country": "\n\nВыберите страну аккаунта.", "contacts": "\n\nМинимальное число контактов.",
                  "spam": "\n\nСпамблок на аккаунте.",
+                 "origin": "\n\nПроисхождение аккаунта. Коды взяты с lzt.market; на tronaccs "
+                           "совпадение проверяется по названию в лоте.",
                  "price": "\n\nЦена в рублях. На tronaccs считается с комиссией."}
         return "⚙️ <b>Настройки поиска</b>\n\n" + html.escape(self._label(s)) + hints.get(view, "")
 
@@ -1709,6 +1729,8 @@ class Bot:
                 params.append(("min_contacts", str(s["contacts"])))
             if s["spam"] != "any":
                 params.append(("spam", s["spam"]))
+            if s.get("origin", "any") != "any":
+                params.append(("origin[]", s["origin"]))
             if s.get("price_min") is not None:
                 params.append(("pmin", str(s["price_min"])))
             if s.get("price_max") is not None:
@@ -1728,6 +1750,8 @@ class Bot:
                 parts.append(f"contacts>={s['contacts']}")
             if s["spam"] != "any":
                 parts.append(f"spam={s['spam']}")
+            if s.get("origin", "any") != "any":
+                parts.append(f"origin={s['origin']}")
             if s.get("price_min") is not None:
                 parts.append(f"price>={s['price_min']}")
             if s.get("price_max") is not None:
@@ -1794,6 +1818,10 @@ class Bot:
             s["spam"] = value
             self.state.save()
             self.show_settings(p, chat_id, message_id, "main")
+        elif kind == "origin":
+            s["origin"] = "any" if value.lower() == "any" else value.lower()
+            self.state.save()
+            self.show_settings(p, chat_id, message_id, "main")
         elif kind in ("price_min", "price_max"):
             if value == "ask":
                 self.awaiting[chat_id] = (user_id, kind)
@@ -1829,6 +1857,7 @@ class Bot:
                 "country": reg.get("country", "UZ"),
                 "contacts": reg.get("contacts", 100),
                 "spam": reg.get("spam", "no"),
+                "origin": reg.get("origin", "any"),
                 "price_min": reg.get("price_min"),
                 "price_max": reg.get("price_max"),
                 "lzt": True,
@@ -1861,6 +1890,7 @@ class Bot:
         hints = {"country": "\n\nКод страны двумя буквами.",
                  "contacts": "\n\nМинимальное число контактов.",
                  "spam": "\n\nСпамблок на аккаунте.",
+                 "origin": "\n\nПроисхождение аккаунта. На tronaccs сверяется по названию в лоте.",
                  "price": "\n\nМаксимальная цена — это ваш лимит на автопокупку.",
                  "source": "\n\nС каких площадок покупать. Можно отметить обе."}
         lines.append(hints.get(view, ""))
@@ -1903,6 +1933,19 @@ class Bot:
                 {"text": ("✅ " if s["spam"] == "yes" else "") + "Со спамблоком", "callback_data": "ab:spam:yes"},
                 {"text": ("✅ " if s["spam"] == "any" else "") + "Любой", "callback_data": "ab:spam:any"},
             ], [{"text": "← Назад", "callback_data": "ab:menu:0"}]]}
+        if view == "origin":
+            rows, row = [], []
+            for c in self.ORIGINS:
+                row.append({"text": ("✅ " if s.get("origin", "any") == c else "") + origin_name(c),
+                            "callback_data": f"ab:origin:{c}"})
+                if len(row) == 2:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append([{"text": ("✅ " if s.get("origin", "any") == "any" else "") + "Любое",
+                          "callback_data": "ab:origin:any"}])
+            rows.append([{"text": "← Назад", "callback_data": "ab:menu:0"}])
+            return {"inline_keyboard": rows}
         if view == "price":
             lo, hi = s.get("price_min"), s.get("price_max")
             row = [{"text": ("✅ " if hi == n else "") + f"до {n}",
@@ -1924,6 +1967,7 @@ class Bot:
             [{"text": f"🌍 Страна: {country_name(s['country'])}", "callback_data": "ab:view:country"}],
             [{"text": f"👥 Контактов от: {s['contacts']}", "callback_data": "ab:view:contacts"}],
             [{"text": f"🚫 Спамблок: {spam}", "callback_data": "ab:view:spam"}],
+            [{"text": f"📦 Происхождение: {origin_name(s.get('origin', 'any'))}", "callback_data": "ab:view:origin"}],
             [{"text": f"💰 Цена: {self._price_text(s)}", "callback_data": "ab:view:price"}],
             [{"text": "💾 Сохранить условия", "callback_data": "ab:apply:0"}],
             [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
@@ -2041,6 +2085,11 @@ class Bot:
             self.show_autobuy(p, chat_id, message_id, "main")
         elif kind == "spam":
             s["spam"] = value
+            autobuy_reset(ab, attempts=False)
+            self.state.save()
+            self.show_autobuy(p, chat_id, message_id, "main")
+        elif kind == "origin":
+            s["origin"] = "any" if value.lower() == "any" else value.lower()
             autobuy_reset(ab, attempts=False)
             self.state.save()
             self.show_autobuy(p, chat_id, message_id, "main")

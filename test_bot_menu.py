@@ -243,3 +243,75 @@ class OriginTests(unittest.TestCase):
     def test_origin_is_html_escaped(self):
         text = monitor.format_item({"item_id": 1, "price": 10, "item_origin": "<b>x</b>"})
         self.assertIn("📦 Происхождение: &lt;b&gt;x&lt;/b&gt;", text)
+
+
+class OriginSettingTests(unittest.TestCase):
+    """Фильтр по происхождению аккаунта в /settings и AutoBuy."""
+
+    def setUp(self):
+        self.p = {"user_id": 1, "name": "owner", "chats": [10],
+                  "query": "country[]=UZ&min_contacts=80&spam=no&pmax=200",
+                  "tron_filter": "country=UZ contacts>=80 spam=no price<=200", "category": "telegram",
+                  "seen": {"lzt": [], "tron": []}, "init": {"lzt": False, "tron": False}}
+        self.tg = Mock()
+        self.tg.send_screen.return_value = 100
+        self.tg.edit_text.return_value = True
+        self.tg.can_recreate_screen.return_value = False
+        self.state = SimpleNamespace(users={}, get=lambda uid: self.p if uid == 1 else None, save=Mock(),
+                                     owner_id=1, country_ids={"UZ": 1}, lock=threading.RLock(),
+                                     reset_seen=Mock())
+        self.cfg = SimpleNamespace(poll_interval=30, owner_ids={1}, tron_category='telegram')
+        self.bot = monitor.Bot(self.cfg, self.state, self.tg)
+        self.rt = SimpleNamespace(lzt=Mock(), tron=Mock(),
+                                  stats={"last_items": 0, "tron_items": 0}, lock=threading.Lock(),
+                                  record_error=Mock(), rebuild=Mock())
+        self.bot.runtime = Mock(return_value=self.rt)
+
+    def _cb(self, parts):
+        self.bot.handle_settings_callback(
+            {'id': 'q', 'from': {'id': 1}, 'message': {'chat': {'id': 10}, 'message_id': 100}}, parts)
+
+    def test_criteria_shows_origin_line(self):
+        self.assertIn("📦 Происхождение: не имеет значения", criteria(settings_from_query(self.p["query"])))
+
+    def test_query_origin_is_parsed_and_named(self):
+        s = settings_from_query("country[]=UZ&origin[]=brute")
+        self.assertEqual(s["origin"], "brute")
+        self.assertIn("📦 Происхождение: брут", criteria(s))
+
+    def test_pick_origin_updates_settings(self):
+        self.bot.current_settings(self.p)
+        self._cb(['set', 'origin', 'stealer'])
+        self.assertEqual(self.p['settings']['origin'], 'stealer')
+        self.assertIn('стилер', self.tg.edit_text.call_args.args[2])
+
+    def test_any_origin_clears(self):
+        self.bot.current_settings(self.p)
+        self.p['settings']['origin'] = 'brute'
+        self._cb(['set', 'origin', 'any'])
+        self.assertEqual(self.p['settings']['origin'], 'any')
+
+    def test_apply_writes_origin_to_both_filters(self):
+        self.bot.show_menu(self.p, 10)
+        s = self.bot.current_settings(self.p)
+        s['origin'] = 'brute'
+        self.bot.apply_settings(self.p, 10)
+        self.assertIn('origin[]=brute', self.p['query'])
+        self.assertIn('origin=brute', self.p['tron_filter'])
+
+    def test_apply_any_origin_leaves_filters_clean(self):
+        self.bot.show_menu(self.p, 10)
+        self.bot.apply_settings(self.p, 10)
+        self.assertNotIn('origin', self.p['query'])
+        self.assertNotIn('origin', self.p['tron_filter'])
+
+    def test_origin_not_flagged_as_link_extra(self):
+        text = lzt_criteria("country[]=UZ&origin[]=brute")
+        self.assertNotIn("Дополнительные условия", text)
+
+    def test_autobuy_origin_in_params_and_filter(self):
+        from monitor import autobuy_lzt_params, autobuy_tron_filter
+        s = {"country": "any", "contacts": 0, "spam": "any", "origin": "stealer",
+             "price_min": None, "price_max": None}
+        self.assertIn(("origin[]", "stealer"), autobuy_lzt_params(s))
+        self.assertIn("origin=stealer", autobuy_tron_filter(s))

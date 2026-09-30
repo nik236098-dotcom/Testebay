@@ -19,6 +19,21 @@ def country_name(code):
     return "любая страна" if code == "ANY" else COUNTRIES.get(code, "страна с кодом " + code)
 
 
+# Коды происхождения аккаунта у lzt.market (item_origin) -> русское название.
+# Тот же код уходит в фильтр площадки: lzt как origin[]=<код>, tronaccs как origin=<код>
+# (там он сверяется на нашей стороне, т.к. сервер ждёт числовой ID без справочника).
+ORIGINS = {
+    "brute": "брут", "stealer": "стилер", "fishing": "фишинг",
+    "autoreg": "авторег", "personal": "личный", "resale": "перепродажа",
+    "retrive": "восстановленный", "dummy": "пустышка",
+}
+
+
+def origin_name(code):
+    code = str(code or "any").lower()
+    return "любое" if code == "any" else ORIGINS.get(code, code)
+
+
 def number(value):
     try:
         n = Decimal(str(value))
@@ -51,10 +66,13 @@ def price_text(settings):
 def criteria(settings):
     contacts = settings.get("contacts", 0)
     spam = {"no": "только без спамблока", "yes": "только со спамблоком", "any": "не имеет значения"}.get(settings.get("spam"), "не имеет значения")
+    origin = settings.get("origin") or "any"
+    origin_line = "не имеет значения" if origin == "any" else origin_name(origin)
     return "\n".join([
         "🌍 Страна: " + country_name(settings.get("country")),
         "👥 Контакты: " + ("не меньше " + number(contacts) if contacts else "без ограничений"),
         "🚫 Спамблок: " + spam,
+        "📦 Происхождение: " + origin_line,
         "💰 Цена: " + price_text(settings),
     ])
 
@@ -72,7 +90,9 @@ def settings_from_query(query):
         except (TypeError, ValueError, OverflowError):
             return default
     return {"country": first("country[]", "any") or "any", "contacts": numeric("min_contacts", 0),
-            "spam": first("spam") if first("spam") in ("yes", "no") else "any", "price_min": numeric("pmin"), "price_max": numeric("pmax")}
+            "spam": first("spam") if first("spam") in ("yes", "no") else "any",
+            "origin": (first("origin[]", "any") or "any").lower(),
+            "price_min": numeric("pmin"), "price_max": numeric("pmax")}
 
 
 def lzt_criteria(query):
@@ -81,7 +101,7 @@ def lzt_criteria(query):
     codes = q.get("country[]", [])
     if len(codes) > 1:
         text = text.replace("🌍 Страна: " + country_name(codes[0]), "🌍 Страны: " + ", ".join(country_name(c) for c in codes), 1)
-    extra = set(q) - {"country[]", "min_contacts", "spam", "pmin", "pmax", "order_by", "page"}
+    extra = set(q) - {"country[]", "min_contacts", "spam", "origin[]", "pmin", "pmax", "order_by", "page"}
     if extra:
         text += "\nДополнительные условия заданы ссылкой на площадку."
     return text
@@ -90,6 +110,7 @@ def lzt_criteria(query):
 def tron_criteria(rules):
     labels = {"country": "🌍 Страна", "страна": "🌍 Страна", "contacts": "👥 Контакты",
               "контакты": "👥 Контакты", "spam": "🚫 Спамблок", "спам": "🚫 Спамблок", "price": "💰 Цена", "цена": "💰 Цена",
+              "origin": "📦 Происхождение", "происхождение": "📦 Происхождение",
               "premium": "Премиум", "two_fa": "Двухэтапная защита", "dialogs": "Диалоги", "channels": "Каналы", "chats": "Чаты"}
     ops = {"=": "", "!=": "не ", ">=": "не меньше ", "<=": "не больше ", ">": "больше ", "<": "меньше ", "~": "содержит "}
     lines = []
@@ -99,13 +120,15 @@ def tron_criteria(rules):
         if key not in labels:
             extras = True
             continue
-        canonical = {"страна": "country", "контакты": "contacts", "спам": "spam", "цена": "price"}.get(key, key)
+        canonical = {"страна": "country", "контакты": "contacts", "спам": "spam", "цена": "price", "происхождение": "origin"}.get(key, key)
         present.add(canonical)
         rendered = str(value)
         if canonical == "country":
             rendered = country_name(value)
         elif canonical == "spam":
             rendered = {"no": "без спамблока", "false": "без спамблока", "0": "без спамблока", "yes": "со спамблоком", "true": "со спамблоком", "1": "со спамблоком"}.get(str(value).lower(), "неизвестное значение")
+        elif canonical == "origin":
+            rendered = origin_name(value)
         elif canonical == "price":
             rendered = money(value)
         elif canonical in ("contacts", "dialogs", "channels", "chats"):
@@ -113,7 +136,7 @@ def tron_criteria(rules):
         else:
             rendered = {"1": "да", "true": "да", "yes": "да", "0": "нет", "false": "нет", "no": "нет"}.get(str(value).lower(), str(value))
         lines.append(labels[key] + ": " + ops.get(op, "") + rendered)
-    for key, label, default in (("country", "🌍 Страна", "любая страна"), ("contacts", "👥 Контакты", "без ограничений"), ("spam", "🚫 Спамблок", "не имеет значения"), ("price", "💰 Цена", "без ограничений")):
+    for key, label, default in (("country", "🌍 Страна", "любая страна"), ("contacts", "👥 Контакты", "без ограничений"), ("spam", "🚫 Спамблок", "не имеет значения"), ("origin", "📦 Происхождение", "не имеет значения"), ("price", "💰 Цена", "без ограничений")):
         if key not in present:
             lines.append(label + ": " + default)
     if extras:

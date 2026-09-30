@@ -849,7 +849,7 @@ FIELD_LABELS: list[tuple[tuple[str, ...], str, str]] = [
 ORIGIN_LABELS = {
     "autoreg": "авторег", "self_registration": "саморег", "brute": "брут", "stealer": "стилер",
     "personal": "личный", "resale": "перепродажа", "fishing": "фишинг", "retrive": "восстановленный",
-    "dummy": "пустышка", "phishing": "фишинг", "farm": "ферма",
+    "dummy": "пустышка", "phishing": "фишинг", "phish": "фишинг", "farm": "ферма",
 }
 
 
@@ -871,7 +871,7 @@ def origin_text(item: dict) -> str:
     tronaccs после normalize кладёт то, что нашёл (название или ID), в item_origin.
     Нет ни одного поля — пустая строка, строка в сообщении не печатается."""
     code = _first(item, "item_origin", "origin", "origin_name", "origin_title", "account_origin")
-    phrase = _first(item, "itemOriginPhrase", "item_origin_phrase", "origin_phrase")
+    phrase = _first(item, "itemOriginPhrase", "item_origin_phrase", "origin_phrase", "item_origin_title")
     label = _origin_label(code)
     if label and label == str(code).strip() and phrase:
         # код без перевода в нашем словаре — берём фразу площадки, она уже человекочитаемая

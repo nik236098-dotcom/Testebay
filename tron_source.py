@@ -8,12 +8,15 @@ tronaccs.market через System API v2 (https://tronaccs-market.readme.io).
     POST https://system-api.tronaccs.market/items/{id}/purchase
     Authorization: Bearer <токен из настроек аккаунта, раздел "API TronAccs">
 
-Ответ списка: {"status": "ok", "items": [{item_id, item_url, published_date, title, price,
-price_currency, price_fees, telegram_counrty (код страны, опечатка в API),
-telegram_contacts_count, telegram_spam_block, telegram_premium, telegram_channels_count,
-telegram_conversations_count, telegram_password (2FA), ...}]}
-Происхождение аккаунта в ответе может лежать под разными ключами (item_origin, origin,
-origin_name, вложенный объект или числовой ID) — см. _origin().
+Формат ответа менялся, normalize() понимает оба варианта:
+- старый плоский: {"status": "ok", "items": [{item_id, item_url, published_date, title,
+  price, telegram_counrty (опечатка API), telegram_contacts_count, telegram_spam_block, ...}]}
+- текущий: {"data": [{id, title, price, time_add, telegram: {country: {countryCode}, contacts,
+  dialogs, channels, spamblock, two_factor, premium, ...}, item_origin: {id, type, title}}],
+  "hasMore": true}
+Происхождение (item_origin) бывает строкой, числовым ID или объектом {id, type, title};
+_origin_pair() возвращает код (для фильтра) и название (для показа), а canon_origin()
+сводит коды lzt и типы tronaccs к одному канону, чтобы фильтр совпадал на обеих площадках.
 
 Фильтр пользователя (строка вида "country=UZ contacts>=100 spam=no price<=500")
 разбирается в parse_filter; то, что умеет сервер, уходит параметрами запроса
@@ -174,6 +177,12 @@ def _to_number(value):
 
 
 def _match_rule(item: dict, key: str, op: str, expected: str) -> bool:
+    if key in ("origin", "происхождение"):
+        actual = canon_origin(item.get("item_origin"))
+        exp = canon_origin(expected)
+        if not actual:
+            return False
+        return (actual == exp) if op != "!=" else (actual != exp)
     real_key = _find_key(item, key)
     if real_key is None:
         return False
@@ -222,29 +231,93 @@ def _to_ts(value) -> int | None:
 
 ORIGIN_KEYS = ("item_origin", "origin", "origin_name", "origin_title", "item_origin_name", "account_origin")
 
+# Приводим любые обозначения происхождения (коды lzt, типы tronaccs, русские названия)
+# к одному канону, чтобы фильтр по происхождению совпадал независимо от площадки.
+ORIGIN_SYNONYMS = {
+    "fishing": "фишинг", "phishing": "фишинг", "phish": "фишинг", "фишинг": "фишинг",
+    "brute": "брут", "брут": "брут",
+    "stealer": "стилер", "лог": "стилер", "logs": "стилер", "стилер": "стилер",
+    "autoreg": "авторег", "self_registration": "авторег", "reg": "авторег",
+    "авторег": "авторег", "саморег": "авторег",
+    "personal": "личный", "личный": "личный",
+    "resale": "перепродажа", "перепродажа": "перепродажа",
+    "retrive": "восстановленный", "retrieve": "восстановленный", "восстановленный": "восстановленный",
+    "dummy": "пустышка", "пустышка": "пустышка",
+}
 
-def _origin(raw: dict):
-    """Происхождение аккаунта из ответа tronaccs: поле может называться по-разному и быть
-    строкой, числовым ID (как в фильтре origin=<ID>) или вложенным объектом {id, name}.
-    Возвращаем название, если оно есть, иначе ID; None — если ничего не нашли."""
-    candidates = [raw.get(k) for k in ORIGIN_KEYS if k in raw]
-    candidates += [v for k, v in raw.items()
-                   if "origin" in k.lower() and "original" not in k.lower() and k not in ORIGIN_KEYS]
-    for value in candidates:
-        if isinstance(value, dict):
-            named = value.get("name") or value.get("title") or value.get("slug") or value.get("code")
-            if named not in (None, ""):
-                return str(named)
-            if value.get("id") not in (None, ""):
-                return value.get("id")
-            continue
-        if value not in (None, "", [], {}):
-            return value
-    return None
+
+def canon_origin(value) -> str:
+    """Каноничное имя происхождения в нижнем регистре; неизвестное значение — как есть."""
+    text = str(value or "").strip().lower()
+    return ORIGIN_SYNONYMS.get(text, text)
+
+
+def _origin_pair(raw: dict):
+    """Из ответа tronaccs достаём происхождение. Оно приходит объектом
+    {"id": 2, "type": "phish", "title": "Фишинг"}, но может быть строкой или числом.
+    Возвращаем (код, название): код для фильтра, название для показа."""
+    value = None
+    for key in ORIGIN_KEYS:
+        if key in raw:
+            value = raw[key]
+            break
+    if value is None:
+        for key, val in raw.items():
+            if "origin" in key.lower() and "original" not in key.lower():
+                value = val
+                break
+    if isinstance(value, dict):
+        # type/slug/code — машинный код; name бывает и кодом ("stealer"), и названием
+        code = value.get("type") or value.get("slug") or value.get("code") or value.get("name")
+        title = value.get("title") or value.get("name")
+        if not code and value.get("id") not in (None, ""):
+            code = value.get("id")
+        return (code if code not in (None, "") else None), (title if title not in (None, "") else None)
+    if value not in (None, "", [], {}):
+        return value, None
+    return None, None
+
+
+# Соответствие полей вложенного объекта telegram текущего API плоским именам,
+# на которые рассчитаны показ (FIELD_LABELS) и фильтр (FIELD_ALIASES).
+_TELEGRAM_MAP = {
+    "premium": "telegram_premium",
+    "two_factor": "telegram_password",
+    "contacts": "telegram_contacts_count",
+    "dialogs": "telegram_conversations_count",
+    "channels": "telegram_channels_count",
+    "chats": "telegram_chats_count",
+    "raiting_level": "telegram_raiting_level",
+    "raiting_stars": "telegram_raiting_stars",
+    "admin_channels_count": "telegram_admin_channels_count",
+    "dc_id": "telegram_dc_id",
+}
+
+
+def _map_nested_telegram(item: dict, tg: dict) -> None:
+    country = tg.get("country")
+    if isinstance(country, dict):
+        code = country.get("countryCode") or country.get("code")
+        if code:
+            item["telegram_country"] = code
+        if country.get("name"):
+            item["telegram_country_name"] = country["name"]
+    elif country not in (None, ""):
+        item["telegram_country"] = country
+    spam = tg.get("spamblock")
+    if spam is not None:
+        # 0 — нет спамблока, 1 постоянный, 3 временный. Храним bool: и показ (нет/есть),
+        # и фильтр spam=no/yes работают одинаково для обеих площадок.
+        item["telegram_spam_block"] = spam not in (0, "0", False)
+    for src, dst in _TELEGRAM_MAP.items():
+        if tg.get(src) not in (None, ""):
+            item[dst] = tg[src]
 
 
 def normalize(raw: dict) -> dict | None:
-    """Приводим лот tronaccs к виду лота lzt, чтобы форматирование и кнопки были общими."""
+    """Приводим лот tronaccs к виду лота lzt, чтобы форматирование и кнопки были общими.
+    Понимаем и старый плоский ответ (telegram_* прямо в лоте), и текущий с вложенным
+    объектом telegram и происхождением-объектом item_origin."""
     try:
         item_id = int(raw.get("item_id") or raw.get("id"))
     except (TypeError, ValueError):
@@ -253,15 +326,17 @@ def normalize(raw: dict) -> dict | None:
     p = _to_number(price)
     if p is not None:
         price = int(p) if p.is_integer() else p
+    origin_code, origin_title = _origin_pair(raw)
     item = {
         "item_id": item_id,
         "title": str(raw.get("title") or f"Лот #{item_id}"),
         "price": price,
         "price_currency": str(raw.get("price_currency") or "rub").lower(),
-        "published_date": _to_ts(raw.get("published_date")),
-        "url": raw.get("item_url") or f"{TRON_SITE}/{raw.get('category') or 'telegram'}/{item_id}",
+        "published_date": _to_ts(raw.get("published_date") or raw.get("time_add")),
+        "url": raw.get("item_url") or raw.get("url") or f"{TRON_SITE}/{raw.get('category') or 'telegram'}/{item_id}",
         "source": "tron",
-        "item_origin": _origin(raw),
+        "item_origin": origin_code,
+        "item_origin_title": origin_title,
         "seller_username": raw.get("seller_username"),
         "raw": raw,
     }
@@ -269,6 +344,13 @@ def normalize(raw: dict) -> dict | None:
     for key, value in raw.items():
         if key.startswith("telegram_") and value not in (None, ""):
             item["telegram_country" if key == "telegram_counrty" else key] = value
+    # текущий API: всё лежит во вложенном объекте telegram
+    tg = raw.get("telegram")
+    if isinstance(tg, dict):
+        _map_nested_telegram(item, tg)
+    seller = raw.get("seller")
+    if not item["seller_username"] and isinstance(seller, dict):
+        item["seller_username"] = seller.get("username")
     base = _to_number(raw.get("price"))
     if base is not None and raw.get("price_fees") not in (None, "") and base != _to_number(raw.get("price_fees")):
         item["web_details"] = f"без комиссии {int(base) if base.is_integer() else base}"
@@ -375,7 +457,7 @@ class TronApiClient:
             data = self.fetch_raw_page(page, params, retries=retries)
             if isinstance(data, dict) and str(data.get("status", "ok")).lower() not in ("ok", "true", "success", "1"):
                 raise TronError(f"tronaccs: {_readable(data)}")
-            raw_list = data.get("items") if isinstance(data, dict) else data
+            raw_list = (data.get("items") or data.get("data")) if isinstance(data, dict) else data
             if not isinstance(raw_list, list) or not raw_list:
                 break
             for raw in raw_list:

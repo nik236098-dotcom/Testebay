@@ -315,3 +315,65 @@ class OriginSettingTests(unittest.TestCase):
              "price_min": None, "price_max": None}
         self.assertIn(("origin[]", "stealer"), autobuy_lzt_params(s))
         self.assertIn("origin=stealer", autobuy_tron_filter(s))
+
+
+class TronNestedApiTests(unittest.TestCase):
+    """Разбор текущего ответа tronaccs: список в data, поля во вложенном telegram,
+    происхождение объектом item_origin."""
+
+    SAMPLE = {
+        "id": 1376608, "category_id": 1, "title": "Прямо с панельки", "price": 50,
+        "time_add": "2026-09-29T22:28:12.000Z",
+        "telegram": {"country": {"name": "Россия", "countryCode": "RU"}, "premium": 0,
+                     "spamblock": 1, "two_factor": 1, "contacts": 321, "dialogs": 267,
+                     "channels": 19, "admin_channels_count": 0, "dc_id": None},
+        "item_origin": {"id": 2, "type": "phish", "title": "Фишинг"},
+        "seller": {"id": 883, "username": "eoy52"},
+    }
+
+    def test_normalize_maps_nested_fields(self):
+        from tron_source import normalize
+        it = normalize(self.SAMPLE)
+        self.assertEqual(it["source"], "tron")
+        self.assertEqual(it["item_id"], 1376608)
+        self.assertEqual(it["telegram_country"], "RU")
+        self.assertEqual(it["telegram_contacts_count"], 321)
+        self.assertEqual(it["telegram_conversations_count"], 267)
+        self.assertEqual(it["telegram_channels_count"], 19)
+        self.assertIs(it["telegram_spam_block"], True)
+        self.assertEqual(it["seller_username"], "eoy52")
+        self.assertIsNotNone(it["published_date"])
+        self.assertEqual(it["item_origin"], "phish")
+        self.assertEqual(it["item_origin_title"], "Фишинг")
+
+    def test_format_shows_origin_and_spam(self):
+        from tron_source import normalize
+        text = monitor.format_item(normalize(self.SAMPLE))
+        self.assertIn("📦 Происхождение: фишинг", text)
+        self.assertIn("🚫 Спамблок: есть ⛔", text)
+        self.assertIn("🏪 tronaccs", text)
+
+    def test_no_spamblock_shows_net(self):
+        from tron_source import normalize
+        raw = dict(self.SAMPLE, telegram=dict(self.SAMPLE["telegram"], spamblock=0))
+        self.assertIn("🚫 Спамблок: нет ✅", monitor.format_item(normalize(raw)))
+
+    def test_origin_filter_matches_across_platforms(self):
+        from tron_source import normalize, match_filter, parse_filter
+        it = normalize(self.SAMPLE)  # tron type "phish"
+        self.assertTrue(match_filter(it, parse_filter("origin=fishing")))   # код lzt
+        self.assertTrue(match_filter(it, parse_filter("origin=phish")))     # тип tronaccs
+        self.assertFalse(match_filter(it, parse_filter("origin=brute")))
+
+    def test_fetch_items_reads_data_key(self):
+        from tron_source import TronApiClient
+        client = TronApiClient("x", "telegram", 1)
+        client.fetch_raw_page = lambda page, params, retries=5: {"data": [self.SAMPLE], "hasMore": False}
+        items = client.fetch_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["item_origin"], "phish")
+
+    def test_scalar_and_missing_origin_still_work(self):
+        from tron_source import normalize
+        self.assertEqual(normalize({"id": 1, "price": 1, "item_origin": "brute"})["item_origin"], "brute")
+        self.assertIsNone(normalize({"id": 1, "price": 1})["item_origin"])

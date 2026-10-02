@@ -522,3 +522,17 @@ class AutobuyBehaviorTests(unittest.TestCase):
         self.assertEqual(bought, set())
         self.client.fast_buy.assert_not_called()
         self.assertIn(300, self.ab["seen"]["lzt"])
+
+
+class TronCountryCodeTests(unittest.TestCase):
+    """Код страны из лота tronaccs читается в обоих форматах ответа."""
+
+    def test_nested_shape(self):
+        raw = {"telegram": {"country": {"name": "Узбекистан", "countryCode": "UZ"}}}
+        self.assertEqual(monitor.TronClient._raw_country_code(raw), "UZ")
+
+    def test_flat_legacy_shape(self):
+        self.assertEqual(monitor.TronClient._raw_country_code({"telegram_counrty": "ru"}), "RU")
+
+    def test_missing(self):
+        self.assertEqual(monitor.TronClient._raw_country_code({"telegram": {}}), "")

@@ -696,13 +696,26 @@ class TronClient:
             return user_error(exc)
         return money(user.get("balance"), user.get("currency") or "RUB") if user else "Баланс недоступен"
 
+    @staticmethod
+    def _raw_country_code(raw: dict) -> str:
+        """Код страны из лота tronaccs в любом формате: плоское telegram_counrty/telegram_country
+        или вложенный объект telegram.country.countryCode (текущий API)."""
+        tg = raw.get("telegram")
+        if isinstance(tg, dict):
+            c = tg.get("country")
+            if isinstance(c, dict) and (c.get("countryCode") or c.get("code")):
+                return str(c.get("countryCode") or c.get("code")).upper()
+            if c not in (None, ""):
+                return str(c).upper()
+        return str(raw.get("telegram_counrty") or raw.get("telegram_country") or "").upper()
+
     def find_country_id(self, code: str, max_id: int = 300, progress=None) -> int | None:
         code = code.upper()
         for cid in range(1, max_id + 1):
             data = self.api.fetch_raw_page(1, {"country": str(cid)})
-            raw = data.get("items") if isinstance(data, dict) else None
+            raw = (data.get("items") or data.get("data")) if isinstance(data, dict) else None
             if raw:
-                codes = {str(r.get("telegram_counrty") or r.get("telegram_country") or "").upper() for r in raw if isinstance(r, dict)}
+                codes = {self._raw_country_code(r) for r in raw if isinstance(r, dict)}
                 if codes == {code}:
                     return cid
             if progress and cid % 50 == 0:

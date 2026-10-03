@@ -3192,7 +3192,11 @@ class Bot:
                 if error:
                     lines.append(html.escape(user_error(error)))
             elif st.get(count_key) is not None:
-                lines.append(f"Подходящих в последней проверке: <b>{st[count_key]}</b>")
+                if name == "tron" and st.get("tron_total") is not None:
+                    # Сырое число до фильтра у себя: видно, доходит ли нужная выборка с сервера
+                    lines.append(f"Получено от площадки: <b>{st['tron_total']}</b>, из них подходящих: <b>{st[count_key]}</b>")
+                else:
+                    lines.append(f"Подходящих в последней проверке: <b>{st[count_key]}</b>")
                 lines.append(f"Новых в этой проверке: <b>{st.get(new_key, 0)}</b>")
                 if st[count_key] == 0:
                     lines.append("По этим условиям ничего не найдено. Проверьте ограничение цены.")

@@ -536,3 +536,33 @@ class TronCountryCodeTests(unittest.TestCase):
 
     def test_missing(self):
         self.assertEqual(monitor.TronClient._raw_country_code({"telegram": {}}), "")
+
+
+class TronOriginRobustMatchTests(unittest.TestCase):
+    """Фильтр происхождения на tronaccs матчит и по коду type, и по русскому title."""
+
+    def _match(self, item_origin, filt="origin=brute,fishing,stealer"):
+        from tron_source import normalize, parse_filter, build_params, match_filter
+        _, local = build_params(parse_filter(filt))
+        it = normalize({"id": 1, "price": 100, "telegram": {"country": {"countryCode": "UZ"}},
+                        "item_origin": item_origin})
+        return match_filter(it, local)
+
+    def test_confirmed_types(self):
+        self.assertTrue(self._match({"type": "phish", "title": "Фишинг"}))
+        self.assertTrue(self._match({"type": "stealer", "title": "Стиллер"}))  # Стиллер с двумя л
+
+    def test_unknown_type_but_known_title(self):
+        self.assertTrue(self._match({"type": "XYZ", "title": "Брут"}))
+
+    def test_spelling_variant_code(self):
+        self.assertTrue(self._match({"type": "brut", "title": "Брут"}))
+
+    def test_not_selected_origin_is_filtered_out(self):
+        self.assertFalse(self._match({"type": "dummy", "title": "Пустышка"}))
+
+    def test_missing_origin_dropped_on_equals(self):
+        from tron_source import normalize, parse_filter, build_params, match_filter
+        _, local = build_params(parse_filter("origin=brute,fishing,stealer"))
+        it = normalize({"id": 1, "price": 100, "telegram": {"country": {"countryCode": "UZ"}}})
+        self.assertFalse(match_filter(it, local))

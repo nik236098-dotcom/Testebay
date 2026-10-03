@@ -178,11 +178,14 @@ def _to_number(value):
 
 def _match_rule(item: dict, key: str, op: str, expected: str) -> bool:
     if key in ("origin", "происхождение"):
-        actual = canon_origin(item.get("item_origin"))
+        # Сверяем и код (item_origin), и русское название (item_origin_title), т.к. tronaccs
+        # может называть тип иначе, чем мы ожидаем; название из лота — источник правды.
+        actual = {canon_origin(v) for v in (item.get("item_origin"), item.get("item_origin_title")) if v}
+        actual.discard("")
         if not actual:
             return op == "!="  # происхождение неизвестно: "не равно" верно, "равно" — нет
         wanted = {canon_origin(x) for x in str(expected).split(",") if x.strip()}
-        hit = actual in wanted
+        hit = bool(actual & wanted)
         return hit if op != "!=" else not hit
     real_key = _find_key(item, key)
     if real_key is None:
@@ -237,15 +240,19 @@ ORIGIN_KEYS = ("item_origin", "origin", "origin_name", "origin_title", "item_ori
 # Подтверждённые типы tronaccs (item_origin.type -> id, title): phish -> 2 «Фишинг»,
 # stealer -> 6 «Стиллер». Сверяем по строке type, поэтому числовой id знать не обязательно.
 ORIGIN_SYNONYMS = {
+    # код lzt / тип tronaccs / русское название (как в title лота) -> общий канон.
+    # Матчим и по коду, и по названию, поэтому важны оба варианта написания.
     "fishing": "фишинг", "phishing": "фишинг", "phish": "фишинг", "фишинг": "фишинг",
-    "brute": "брут", "брут": "брут",
-    "stealer": "стилер", "лог": "стилер", "logs": "стилер", "стилер": "стилер",
-    "autoreg": "авторег", "self_registration": "авторег", "reg": "авторег",
-    "авторег": "авторег", "саморег": "авторег",
-    "personal": "личный", "личный": "личный",
-    "resale": "перепродажа", "перепродажа": "перепродажа",
-    "retrive": "восстановленный", "retrieve": "восстановленный", "восстановленный": "восстановленный",
-    "dummy": "пустышка", "пустышка": "пустышка",
+    "brute": "брут", "brut": "брут", "bruteforce": "брут", "брут": "брут",
+    "stealer": "стилер", "stiller": "стилер", "лог": "стилер", "логи": "стилер",
+    "logs": "стилер", "стилер": "стилер", "стиллер": "стилер",
+    "autoreg": "авторег", "self_registration": "авторег", "selfreg": "авторег", "reg": "авторег",
+    "авторег": "авторег", "автореги": "авторег", "саморег": "авторег", "самореги": "авторег",
+    "personal": "личный", "личный": "личный", "личные": "личный",
+    "resale": "перепродажа", "reseller": "перепродажа", "перепродажа": "перепродажа", "перепродажи": "перепродажа",
+    "retrive": "восстановленный", "retrieve": "восстановленный", "restored": "восстановленный",
+    "восстановленный": "восстановленный", "восстановление": "восстановленный",
+    "dummy": "пустышка", "пустышка": "пустышка", "пустышки": "пустышка",
 }
 
 

@@ -1,0 +1,1 @@
+ALTER TABLE `orders` ADD `delivery` text DEFAULT '{}' NOT NULL;

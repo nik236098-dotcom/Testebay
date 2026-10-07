@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791294396561,
+      "tag": "0000_bored_hulk",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791296216016,
+      "tag": "0001_closed_rachel_grey",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791301820212,
+      "tag": "0002_gray_shard",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791301888454,
+      "tag": "0003_bright_miracleman",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791307074137,
+      "tag": "0004_tough_jane_foster",
+      "breakpoints": true
+    }
+  ]
+}

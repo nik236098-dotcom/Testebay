@@ -1,0 +1,3 @@
+import {notifyOrder} from '@/lib/telegram';
+import {db,requireAdmin,sameOrigin,jsonBody,response,safe,HttpError} from '@/lib/server';
+export async function PATCH(r:Request,{params}:{params:Promise<{id:string}>}){return safe(async()=>{await requireAdmin();sameOrigin(r);const {id}=await params;const v=await jsonBody(r);if(v.retry)return response({notified:await notifyOrder(id)});if(!['new','processing','done','cancelled'].includes(v.status))throw new HttpError(400,'Неизвестный статус.');await db().prepare('UPDATE orders SET status=? WHERE id=?').bind(v.status,id).run();return response({ok:true});});}

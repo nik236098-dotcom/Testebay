@@ -1,0 +1,2 @@
+import {bucket,safe,HttpError} from '@/lib/server';
+export async function GET(_:Request,{params}:{params:Promise<{key:string}>}){return safe(async()=>{const {key}=await params;if(!/^[a-f0-9-]+\.(jpg|png|webp)$/.test(key))throw new HttpError(404,'Фото не найдено.');const obj=await bucket().get(key);if(!obj)throw new HttpError(404,'Фото не найдено.');return new Response(obj.body,{headers:{'Content-Type':obj.httpMetadata?.contentType||'image/jpeg','Cache-Control':'public,max-age=31536000,immutable','X-Content-Type-Options':'nosniff'}});});}

@@ -1,0 +1,1 @@
+ALTER TABLE `orders` ADD `phone` text DEFAULT '' NOT NULL;

@@ -1,0 +1,145 @@
+{
+  "products": [
+    {
+      "id": "kristal-new-year-ball",
+      "name": "Свеча «Новогодний шар»",
+      "description": "Материалы: акриловый гипс, соевый и кокосовый воск, хлопковый фитиль. Вес воска — 110 г.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "11,5 × 9 см",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-new-year-ball-1.jpg",
+        "/images/kristal/product-new-year-ball-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    },
+    {
+      "id": "kristal-carousel-candle",
+      "name": "Свеча «Карусель»",
+      "description": "Материалы: акриловый гипс, соевый и кокосовый воск, хлопковый фитиль. Вес воска — 110 г.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "11 × 8,5 см",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-carousel-candle-1.jpg",
+        "/images/kristal/product-carousel-candle-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    },
+    {
+      "id": "kristal-mandarins",
+      "name": "Свечи «Мандарины»",
+      "description": "Материалы: пчелиный воск, хлопковый фитиль. Аромат мандарина. Есть наборы из двух и трёх свечей.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "Пчелиный воск",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-mandarins-1.jpg",
+        "/images/kristal/product-mandarins-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    },
+    {
+      "id": "kristal-marshmallow-lamb",
+      "name": "Свечи «Зефирный ягненок»",
+      "description": "Материалы: акриловый гипс, соевый и кокосовый воск, хлопковый фитиль. Вес воска — 50 г.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "10 × 8 см",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-marshmallow-lamb-1.jpg",
+        "/images/kristal/product-marshmallow-lamb-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    },
+    {
+      "id": "kristal-lamb-in-barrel",
+      "name": "Свечи «Бараш в бочке»",
+      "description": "Материалы: акриловый гипс, соевый и кокосовый воск, хлопковый фитиль. Вес воска — 120 г.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "15,5 × 13 см",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-lamb-in-barrel-1.jpg",
+        "/images/kristal/product-lamb-in-barrel-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    },
+    {
+      "id": "kristal-carousel-sachet",
+      "name": "Аромасаше «Карусель»",
+      "description": "Материалы: оливковый воск, аромамасла.\nЦвет, аромат, наличие и стоимость согласуем при подтверждении заявки. Для корпоративного заказа — партии от 30 штук.",
+      "category": "kristal-corporate",
+      "volume": "Оливковый воск",
+      "price": 0,
+      "images": [
+        "/images/kristal/product-carousel-sachet-1.jpg",
+        "/images/kristal/product-carousel-sachet-2.jpg"
+      ],
+      "visible": true,
+      "available": true
+    }
+  ],
+  "categories": [
+    {
+      "id": "kristal-308138524212",
+      "name": "Летняя коллекция 🌽",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-924027013032",
+      "name": "В наличии",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-626762307112",
+      "name": "Пасхальная коллекция 🐣",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-343272882442",
+      "name": "Расцветай 🌸",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-830535043592",
+      "name": "Сердечная коллекция ❤️",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-709954426922",
+      "name": "Морская коллекция",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-454249265172",
+      "name": "Осенняя коллекция 🍂",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-437482827862",
+      "name": "Новогодняя коллекция 🎄",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-616458367531",
+      "name": "Аромадиффузоры",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-488682682582",
+      "name": "Комплименты для гостей на свадьбе",
+      "updatedAt": ""
+    },
+    {
+      "id": "kristal-corporate",
+      "name": "Корпоративные подарки",
+      "updatedAt": ""
+    }
+  ]
+}

@@ -34,8 +34,10 @@ try{
  r=await req('/api/admin/reviews',{method:'PUT',auth:true,body:{...r.data.reviews,items:[...r.data.reviews.items].reverse()}});ok(r.status===200,'owner-supplied image cards reorder and save');
  r=await req('/api/admin/documents/offer',{auth:true});const doc=r.data.document;
  r=await req('/api/admin/documents/offer',{method:'PUT',auth:true,body:{...doc,title:'Оферта на сервере'}});ok(r.status===200,'legal document edits save');
- const order={id:crypto.randomUUID(),name:'Тестовый покупатель',phone:'+79991234567',contactMethod:'whatsapp',contact:'+79991234567',comment:'Проверка',consent:true,transferConsent:true,offerConsent:true,delivery:{method:'pickup',city:'',address:'',productionConsent:true},items:[{id:productId,quantity:2}],total:24600};
- r=await req('/api/orders',{method:'POST',body:order});ok(r.status===201,'checkout stores an order');
+ const order={id:crypto.randomUUID(),name:'Тестовый покупатель',phone:'+79991234567',contactMethod:'whatsapp',contact:'+79991234567',comment:'Проверка',rulesAccepted:true,delivery:{method:'pickup',city:'',address:'',productionConsent:false},items:[{id:productId,quantity:2}],total:24600};
+ r=await req('/checkout');ok(r.status===200&&r.data.includes('Оформление заказа'),'checkout is a standalone public page');
+ r=await req('/api/orders',{method:'POST',body:{...order,rulesAccepted:false}});ok(r.status===400,'checkout requires the single rules acceptance');
+ r=await req('/api/orders',{method:'POST',body:order});ok(r.status===201,'checkout stores an order without manufacturing-time consent');
  r=await req('/api/orders',{method:'POST',body:order});ok(r.status===200,'repeated order is not duplicated');
  r=await req('/api/admin/orders',{auth:true});ok(r.data.orders.length===1&&r.data.orders[0].total===24600,'admin reads the order and calculated total');
  r=await req('/api/admin/categories/'+category.id,{method:'DELETE',auth:true,body:{updatedAt:category.updatedAt,moveTo:transferCategory}});ok(r.status===200&&r.data.moved===1,'category deletion transfers products in a SQLite transaction');

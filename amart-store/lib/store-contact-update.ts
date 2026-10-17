@@ -31,10 +31,24 @@ async function applyContactUpdate(marker:string,contactUpdate:Partial<StoreSetti
  ]);
 }
 
+// Rename the store from «Кристал» to «АМАРТ» once in the name, footer and banner texts.
+async function applyBrandRename(){
+ const marker='amart_brand_20261017';
+ const d=env.DB;if(!d)throw new Error('Store database unavailable');
+ if(await d.prepare('SELECT key FROM settings WHERE key=?').bind(marker).first())return;
+ const keys=['store_config','banner_config'];
+ await d.batch([
+  ...keys.map(key=>d.prepare("INSERT OR IGNORE INTO settings (key,value) SELECT ?,value FROM settings WHERE key=? AND NOT EXISTS (SELECT 1 FROM settings WHERE key=?)").bind('before_'+marker+':'+key,key,marker)),
+  ...keys.map(key=>d.prepare("UPDATE settings SET value=json_set(replace(value,'Кристал','АМАРТ'),'$.version',?) WHERE key=? AND instr(value,'Кристал')>0 AND NOT EXISTS (SELECT 1 FROM settings WHERE key=?)").bind(crypto.randomUUID(),key,marker)),
+  d.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').bind(marker,new Date().toISOString())
+ ]);
+}
+
 export async function ensureStoreContactUpdate(){
  await applyContactUpdate(marker,contactUpdate);
  await applyContactUpdate('amart_direct_contacts_20261007',{
   contactPersonalTelegram:'https://t.me/aliya_bylatovna',
   contactWhatsApp:'https://wa.me/79003290910'
  });
+ await applyBrandRename();
 }

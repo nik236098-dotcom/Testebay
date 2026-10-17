@@ -7,5 +7,5 @@ import './redesign.css';
 import './reviews.css';
 import './documents.css';
 export const dynamic='force-dynamic';
-export async function generateMetadata():Promise<Metadata>{let settings=defaultStoreSettings;try{settings=await getStoreSettings()}catch{}return {title:settings.name+' — интернет-магазин',description:settings.catalogDescription.replace(/\s+/g,' ').slice(0,160)||'Каталог товаров. Выберите товары и оформите заказ без регистрации.',icons:{icon:'/favicon.svg'}}}
+export async function generateMetadata():Promise<Metadata>{let settings=defaultStoreSettings;try{settings=await getStoreSettings()}catch{}return {title:settings.name+' — интернет-магазин',description:settings.catalogDescription.replace(/\s+/g,' ').slice(0,160)||'Каталог товаров. Выберите товары и оформите заказ без регистрации.',icons:{icon:[{url:'/favicon.ico',sizes:'any'},{url:'/icon-192.png',type:'image/png',sizes:'192x192'},{url:'/icon-512.png',type:'image/png',sizes:'512x512'}],apple:'/apple-touch-icon.png'}}}
 export default function Layout({children}:{children:React.ReactNode}){return <html lang="ru"><body>{children}<Toaster position="bottom-center" richColors/></body></html>}

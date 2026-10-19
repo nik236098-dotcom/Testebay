@@ -999,16 +999,22 @@ TG_DC = {1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100",
 
 
 def _decode_auth_key(value: str) -> bytes | None:
-    """auth_key приходит hex (512 симв.) или base64 (256 байт)."""
+    """auth_key приходит hex (512 симв.) или base64 (256 байт). Терпим к 0x/пробелам
+    в hex и к обычному и URL-safe base64."""
     s = value.strip()
-    if re.fullmatch(r"[0-9a-fA-F]{512}", s):
+    hexs = re.sub(r"\s+", "", s)
+    if hexs[:2].lower() == "0x":
+        hexs = hexs[2:]
+    if re.fullmatch(r"[0-9a-fA-F]{512}", hexs):
         try:
-            return bytes.fromhex(s)
+            return bytes.fromhex(hexs)
         except ValueError:
             return None
-    if _B64_RE.match(s):
+    compact = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
+        std = compact.replace("-", "+").replace("_", "/")
         try:
-            raw = base64.b64decode(s + "=" * (-len(s) % 4), validate=False)
+            raw = base64.b64decode(std + "=" * (-len(std) % 4), validate=False)
             if len(raw) == 256:
                 return raw
         except Exception:  # noqa: BLE001
@@ -1046,6 +1052,19 @@ def session_from_authkey(flat: dict) -> bytes | None:
                     dc_id = n
             except ValueError:
                 pass
+    if not auth_key:
+        # Поле auth_key названо непривычно (бывает у 2FA-аккаунтов): ищем по содержимому —
+        # строку, которая раскодируется ровно в 256-байтный ключ. Пароль 2FA так не выглядит.
+        for key, value in flat.items():
+            if not isinstance(value, str) or len(value.strip()) < 256:
+                continue
+            low = key.lower()
+            if "pass" in low or "2fa" in low or "two_fa" in low:  # это не ключ, а пароль
+                continue
+            cand = _decode_auth_key(value)
+            if cand:
+                auth_key = cand
+                break
     if not auth_key:
         return None
     dc_id = dc_id or 2

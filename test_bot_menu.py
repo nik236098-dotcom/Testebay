@@ -566,3 +566,48 @@ class TronOriginRobustMatchTests(unittest.TestCase):
         _, local = build_params(parse_filter("origin=brute,fishing,stealer"))
         it = normalize({"id": 1, "price": 100, "telegram": {"country": {"countryCode": "UZ"}}})
         self.assertFalse(match_filter(it, local))
+
+
+class SessionFromAuthKeyTests(unittest.TestCase):
+    """Сборка .session из auth_key: терпимость к кодировкам и имени поля (важно для 2FA)."""
+
+    KEY = bytes(range(256))  # детерминированный 256-байтный ключ
+
+    def _is_session(self, blob):
+        return isinstance(blob, (bytes, bytearray)) and blob[:15] == b"SQLite format 3"
+
+    def test_named_hex(self):
+        import base64, monitor
+        flat = {"auth_key": self.KEY.hex(), "dc_id": 2}
+        self.assertTrue(self._is_session(monitor.session_from_authkey(flat)))
+
+    def test_hex_with_0x_and_spaces(self):
+        import monitor
+        flat = {"telegram.auth_key": "0x" + self.KEY.hex(), "telegram.dc_id": 4}
+        self.assertTrue(self._is_session(monitor.session_from_authkey(flat)))
+
+    def test_urlsafe_base64(self):
+        import base64, monitor
+        b64 = base64.urlsafe_b64encode(self.KEY).decode().rstrip("=")
+        flat = {"authkey": b64, "dcid": 2}
+        self.assertTrue(self._is_session(monitor.session_from_authkey(flat)))
+
+    def test_unusual_field_name_found_by_content(self):
+        import base64, monitor
+        # ключ под именем, которое не содержит auth/key — ловим по содержимому
+        flat = {"session_blob": base64.b64encode(self.KEY).decode(), "dc_id": 3}
+        self.assertTrue(self._is_session(monitor.session_from_authkey(flat)))
+
+    def test_password_not_mistaken_for_key(self):
+        import monitor
+        # поле пароля длиной 256+ не должно быть принято за ключ
+        flat = {"two_fa_password": "x" * 300}
+        self.assertIsNone(monitor.session_from_authkey(flat))
+
+    def test_decode_auth_key_variants(self):
+        import base64, monitor
+        self.assertEqual(monitor._decode_auth_key(self.KEY.hex()), self.KEY)
+        self.assertEqual(monitor._decode_auth_key("0x" + self.KEY.hex()), self.KEY)
+        self.assertEqual(monitor._decode_auth_key(base64.b64encode(self.KEY).decode()), self.KEY)
+        self.assertEqual(monitor._decode_auth_key(base64.urlsafe_b64encode(self.KEY).decode()), self.KEY)
+        self.assertIsNone(monitor._decode_auth_key("1234"))

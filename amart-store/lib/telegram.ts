@@ -1,3 +1,6 @@
+import {request as httpRequest} from 'node:http';
+import {request as httpsRequest} from 'node:https';
+import {connect as tlsConnect} from 'node:tls';
 import {env} from './runtime';
 import {db,getStoreSettings,HttpError,textValue} from './server';
 import {TelegramSettings,contactMethodLabel,productPrice,orderTotal,deliveryLabel} from './shop';
@@ -22,9 +25,41 @@ function publicConfig(c:StoredConfig|null):TelegramSettings{
 export async function getTelegramSettings(){return publicConfig((await readConfig()).config)}
 export async function telegramReady(){try{const c=await getTelegramSettings();return c.enabled&&c.hasToken&&!!c.chatId}catch{return false}}
 async function connection(){const {config}=await readConfig();if(config)return {...config,token:config.sealedToken?await unseal(config.sealedToken):''};return {...publicConfig(null),token:env.TELEGRAM_BOT_TOKEN||''}}
+// TELEGRAM_PROXY=http://login:password@host:port sends Telegram requests through an HTTP proxy (CONNECT tunnel).
+function telegramProxy(){
+ const value=env.TELEGRAM_PROXY.trim();if(!value)return null;
+ const url=new URL(value);if(url.protocol!=='http:')throw new Error('TELEGRAM_PROXY must be an http:// proxy');
+ return url;
+}
+function telegramPost(url:URL,body:string):Promise<{status:number;json():Promise<unknown>}>{
+ const proxy=telegramProxy();
+ if(!proxy)return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body,signal:AbortSignal.timeout(7000),redirect:'manual'});
+ return new Promise((resolve,reject)=>{
+  const target=`${url.hostname}:${url.port||443}`;
+  const auth=proxy.username?{'Proxy-Authorization':'Basic '+Buffer.from(decodeURIComponent(proxy.username)+':'+decodeURIComponent(proxy.password)).toString('base64')}:{};
+  const tunnel=httpRequest({host:proxy.hostname,port:Number(proxy.port)||80,method:'CONNECT',path:target,headers:{Host:target,...auth}});
+  let tunnelSocket:{destroy():void}|undefined;
+  const timer=setTimeout(()=>{tunnel.destroy();tunnelSocket?.destroy();reject(new Error('Telegram proxy timeout'))},10000);
+  const fail=(error:Error)=>{clearTimeout(timer);reject(error)};
+  tunnel.on('error',fail);
+  tunnel.on('connect',(res,socket)=>{
+   tunnelSocket=socket;
+   if(res.statusCode!==200){socket.destroy();return fail(new Error('Telegram proxy answered '+res.statusCode))}
+   const request=httpsRequest({host:url.hostname,path:url.pathname+url.search,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)},createConnection:()=>tlsConnect({socket,servername:url.hostname})},response=>{
+    const chunks:Buffer[]=[];
+    response.on('data',chunk=>chunks.push(chunk));
+    response.on('error',fail);
+    response.on('end',()=>{clearTimeout(timer);socket.destroy();const text=Buffer.concat(chunks).toString('utf8');resolve({status:response.statusCode||0,json:async()=>JSON.parse(text)})});
+   });
+   request.on('error',error=>{socket.destroy();fail(error)});
+   request.end(body);
+  });
+  tunnel.end();
+ });
+}
 async function telegramCall<T>(token:string,method:'getMe'|'sendMessage',body:Record<string,unknown>={}){
- let response:Response;
- try{response=await fetch(`https://api.telegram.org/bot${token}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(7000),redirect:'manual'})}catch{throw new HttpError(502,'Telegram не отвечает. Попробуйте ещё раз через минуту.');}
+ let response:{status:number;json():Promise<unknown>};
+ try{response=await telegramPost(new URL(`https://api.telegram.org/bot${token}/${method}`),JSON.stringify(body))}catch(error){console.warn('Telegram request failed:',error instanceof Error?error.message:error);throw new HttpError(502,'Telegram не отвечает. Попробуйте ещё раз через минуту.');}
  if(response.status>=300&&response.status<400)throw new HttpError(502,'Telegram вернул некорректный ответ. Попробуйте позже.');
  let data:{ok:boolean;result:T;error_code?:number};try{data=await response.json() as typeof data}catch{throw new HttpError(502,'Telegram вернул некорректный ответ. Попробуйте позже.')}
  if(!data.ok){const code=data.error_code||response.status;if(code===401||code===404)throw new HttpError(400,'Токен бота не принят. Проверьте его в @BotFather.');if(code===403)throw new HttpError(400,'Бот не может написать вам. Откройте его в Telegram, нажмите «Запустить» и убедитесь, что он не заблокирован.');if(code===400)throw new HttpError(400,'Проверьте Telegram ID и нажмите «Запустить» в своём боте.');if(code===429)throw new HttpError(429,'Telegram просит подождать. Повторите проверку через минуту.');throw new HttpError(502,'Не удалось отправить запрос в Telegram. Попробуйте позже.')}

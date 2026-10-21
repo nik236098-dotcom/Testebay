@@ -52,6 +52,17 @@ docker compose restart
 
 Чтобы поменять домен, измените `SITE_ADDRESS` и `PUBLIC_ORIGIN` в `.env`, затем выполните `docker compose up -d --force-recreate`. `PUBLIC_ORIGIN` должен быть точным адресом с `https://` без завершающего `/`.
 
+## Telegram через прокси
+
+Если сервер не достаёт до `api.telegram.org`, уведомления можно пустить через HTTP-прокси. Добавьте в `.env` строку и перезапустите приложение:
+
+```bash
+TELEGRAM_PROXY=http://ЛОГИН:ПАРОЛЬ@IP:ПОРТ
+docker compose up -d --force-recreate app
+```
+
+Нужен HTTP-порт прокси (не SOCKS5). Через прокси идут только запросы к Telegram, сайт работает напрямую. Данные прокси храните только в `.env` на сервере, не в GitHub.
+
 ## Локальная разработка
 
 Node.js 24 и pnpm 11.25.0. Скопируйте `.env.example` в `.env`, задайте пароль не короче 12 символов, `PUBLIC_ORIGIN=http://localhost:3000` и случайный `TELEGRAM_CONFIG_KEY` из 64 шестнадцатеричных символов.

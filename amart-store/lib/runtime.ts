@@ -41,4 +41,4 @@ const BUCKET={
  async get(key:string){try{const data=await readFile(imagePath(key));return {body:new Uint8Array(data),httpMetadata:{contentType:key.endsWith('.png')?'image/png':key.endsWith('.webp')?'image/webp':'image/jpeg'}}}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}},
  async delete(key:string){await unlink(imagePath(key)).catch(error=>{if(error.code!=='ENOENT')throw error})}
 };
-export const env={DB,BUCKET,get TELEGRAM_CONFIG_KEY(){return process.env.TELEGRAM_CONFIG_KEY||''},get TELEGRAM_BOT_TOKEN(){return process.env.TELEGRAM_BOT_TOKEN||''},get TELEGRAM_CHAT_ID(){return process.env.TELEGRAM_CHAT_ID||''}};
+export const env={DB,BUCKET,get TELEGRAM_CONFIG_KEY(){return process.env.TELEGRAM_CONFIG_KEY||''},get TELEGRAM_BOT_TOKEN(){return process.env.TELEGRAM_BOT_TOKEN||''},get TELEGRAM_CHAT_ID(){return process.env.TELEGRAM_CHAT_ID||''},get TELEGRAM_PROXY(){return process.env.TELEGRAM_PROXY||''}};
